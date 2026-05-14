@@ -54,6 +54,24 @@ Manual Windows start:
 py .\app.py
 ```
 
+## Telegram Session Helper
+
+`generate_session.py` helps create a Pyrogram `STRING_SESSION` for projects that need a Telegram user session, such as voice chat music bots.
+
+Install the helper dependencies:
+
+```powershell
+py -m pip install pyrogram tgcrypto
+```
+
+Run:
+
+```powershell
+py .\generate_session.py
+```
+
+Use only your own Telegram account. Keep the generated string secret and store it in `.env`, never in public GitHub.
+
 ## Bug Bounty Workflow
 
 1. Confirm the target is in scope.

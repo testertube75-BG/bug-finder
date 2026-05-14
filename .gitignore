@@ -3,4 +3,6 @@ __pycache__/
 .pytest_cache/
 reports/
 *.log
-
+.env
+*.session
+music_user.session
