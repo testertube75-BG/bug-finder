@@ -50,6 +50,6 @@ If starting manually on Windows, use:
 py .\app.py
 ```
 
-## GitHub
+## Responsible Use
 
-I cannot create a GitHub account or password for you. Create/login to your own GitHub account, then I can help push this as a private repository using GitHub CLI or the GitHub website.
+Run scans only against systems you own or have explicit written permission to test. Keep reports private if they include internal URLs, response bodies, or security findings.

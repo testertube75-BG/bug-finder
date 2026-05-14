@@ -323,6 +323,16 @@ def fetch_analyzed_page(url: str, timeout: int, method: str = "GET", data: bytes
     return page, body, body_text
 
 
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def response_words(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9][a-z0-9_-]{1,}", text.lower())[:5000])
 
@@ -736,6 +746,18 @@ def scan_target(raw_target: str, max_pages: int, timeout: int, scan_ports_enable
             continue
         seen.add(current)
         page, _, body_text = fetch_analyzed_page(current, timeout)
+        if not same_origin(page.url, parsed_target):
+            add_finding(
+                findings,
+                title="Off-scope redirect blocked",
+                severity="info",
+                url=current,
+                category="scope",
+                detail="The URL redirected to a different origin and was not scanned further.",
+                evidence=page.url,
+                remediation="Only scan targets inside your approved scope.",
+            )
+            continue
         pages.append(page)
         check_response_analysis(page, findings)
         if mark_soft_404(page, body_text, soft_404_page, soft_404_text):
@@ -842,6 +864,9 @@ class ScoutHandler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("content-length", "0"))
+            if length > MAX_BODY_BYTES:
+                self.send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "Request body too large."})
+                return
             payload = json.loads(self.rfile.read(length) or b"{}")
             max_pages = max(1, min(int(payload.get("max_pages", 8)), MAX_PAGES_LIMIT))
             timeout = max(2, min(int(payload.get("timeout", 8)), 20))
@@ -849,7 +874,7 @@ class ScoutHandler(BaseHTTPRequestHandler):
                 str(payload.get("target", "")),
                 max_pages,
                 timeout,
-                bool(payload.get("scan_ports", True)),
+                parse_bool(payload.get("scan_ports"), True),
                 str(payload.get("ports", "")),
                 str(payload.get("ssrf_callback", "")),
             )
