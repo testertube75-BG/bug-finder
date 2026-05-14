@@ -554,6 +554,91 @@ def check_page_content(page: PageResult, body_text: str, findings: list[Finding]
         add_finding(findings, title="Error/debug information exposed", severity="medium", url=page.url, category="exposure", detail="The response contains error text that can help attackers fingerprint the app.", remediation="Disable debug output in production and return generic errors.")
 
 
+def tls_certificate_info(target: urllib.parse.ParseResult, timeout: int, findings: list[Finding]) -> dict[str, Any]:
+    if target.scheme != "https":
+        return {"enabled": False, "reason": "Target is not HTTPS."}
+    hostname = target.hostname
+    if not hostname:
+        return {"enabled": False, "reason": "Target host missing."}
+    port = target.port or 443
+    info: dict[str, Any] = {"enabled": True, "host": hostname, "port": port}
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((hostname, port), timeout=min(timeout, 8)) as sock:
+            with context.wrap_socket(sock, server_hostname=hostname) as tls_sock:
+                cert = tls_sock.getpeercert()
+                cipher = tls_sock.cipher()
+                not_after = cert.get("notAfter", "")
+                expires_ts = ssl.cert_time_to_seconds(not_after) if not_after else 0
+                days_left = round((expires_ts - time.time()) / 86400) if expires_ts else None
+                subject = dict(item[0] for item in cert.get("subject", []) if item)
+                issuer = dict(item[0] for item in cert.get("issuer", []) if item)
+                info.update(
+                    {
+                        "subject": subject.get("commonName", ""),
+                        "issuer": issuer.get("organizationName") or issuer.get("commonName", ""),
+                        "not_after": not_after,
+                        "days_left": days_left,
+                        "cipher": cipher[0] if cipher else "",
+                        "protocol": tls_sock.version() or "",
+                    }
+                )
+                if days_left is not None and days_left < 0:
+                    add_finding(findings, title="TLS certificate expired", severity="critical", url=f"{hostname}:{port}", category="tls", detail="The HTTPS certificate is expired.", evidence=not_after, remediation="Renew and deploy a valid certificate immediately.")
+                elif days_left is not None and days_left <= 14:
+                    add_finding(findings, title="TLS certificate expires soon", severity="high", url=f"{hostname}:{port}", category="tls", detail="The HTTPS certificate is close to expiry.", evidence=f"{days_left} day(s) left", remediation="Renew the certificate before users see trust warnings.")
+                elif days_left is not None and days_left <= 30:
+                    add_finding(findings, title="TLS certificate renewal window", severity="medium", url=f"{hostname}:{port}", category="tls", detail="The HTTPS certificate expires within 30 days.", evidence=f"{days_left} day(s) left", remediation="Schedule certificate renewal.")
+    except Exception as exc:
+        info.update({"error": f"{type(exc).__name__}: {exc}"})
+        add_finding(findings, title="TLS certificate check failed", severity="medium", url=f"{hostname}:{port}", category="tls", detail="The scanner could not complete a TLS handshake/certificate check.", evidence=info["error"], remediation="Confirm HTTPS is correctly configured and reachable.")
+    return info
+
+
+def discover_public_security_files(root: str, timeout: int, findings: list[Finding]) -> tuple[list[PageResult], list[dict[str, Any]]]:
+    targets = [
+        ("/robots.txt", "Robots policy"),
+        ("/.well-known/security.txt", "Security contact policy"),
+        ("/security.txt", "Security contact policy"),
+        ("/sitemap.xml", "Sitemap"),
+    ]
+    pages: list[PageResult] = []
+    discoveries: list[dict[str, Any]] = []
+    for path, label in targets:
+        url = root + path
+        page, _, text = fetch_analyzed_page(url, timeout)
+        pages.append(page)
+        found = bool(page.status and page.status < 400 and text.strip())
+        item = {
+            "path": path,
+            "label": label,
+            "url": page.url,
+            "status": page.status,
+            "found": found,
+            "content_type": page.content_type,
+            "preview": text[:900],
+        }
+        discoveries.append(item)
+        if not found:
+            continue
+        if path.endswith("security.txt"):
+            if re.search(r"(?im)^contact\s*:", text):
+                add_finding(findings, title="Security contact policy found", severity="info", url=page.url, category="discovery", detail="A security.txt contact policy is available for responsible disclosure.", evidence=path, remediation="Keep contact and policy fields current.")
+            else:
+                add_finding(findings, title="Security policy file lacks Contact field", severity="low", url=page.url, category="discovery", detail="security.txt exists but does not include a Contact field.", remediation="Add a Contact field so researchers know where to report issues.")
+        elif path == "/robots.txt":
+            disallows = re.findall(r"(?im)^\s*disallow\s*:\s*(\S+)", text)
+            if disallows:
+                add_finding(findings, title="Robots disallow paths discovered", severity="info", url=page.url, category="discovery", detail="robots.txt reveals paths that may deserve manual review.", evidence=", ".join(disallows[:8]), remediation="Do not place sensitive URLs in robots.txt as a protection mechanism.")
+        elif path == "/sitemap.xml":
+            urls = re.findall(r"<loc>\s*([^<]+)", text, re.I)
+            if urls:
+                add_finding(findings, title="Sitemap URLs discovered", severity="info", url=page.url, category="discovery", detail="sitemap.xml exposes crawlable URLs for manual testing.", evidence=", ".join(urls[:5]), remediation="Ensure only intended public URLs are listed.")
+    if not any(item["found"] and item["path"].endswith("security.txt") for item in discoveries):
+        add_finding(findings, title="Security contact policy missing", severity="low", url=root, category="discovery", detail="No security.txt file was found at standard locations.", remediation="Publish /.well-known/security.txt with reporting instructions if you accept vulnerability reports.")
+    return pages, discoveries
+
+
 def query_with_param(url: str, name: str, value: str) -> str:
     parsed = urllib.parse.urlparse(url)
     params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -720,6 +805,8 @@ def scan_target(raw_target: str, max_pages: int, timeout: int, scan_ports_enable
     findings: list[Finding] = []
     started = time.time()
     root = f"{parsed_target.scheme}://{parsed_target.netloc}"
+    tls_info = tls_certificate_info(parsed_target, timeout, findings)
+    discovery_pages, discoveries = discover_public_security_files(root, timeout, findings)
     soft_404_url = f"{root}/__bg_missing_{int(started * 1000)}"
     soft_404_page, _, soft_404_text = fetch_analyzed_page(soft_404_url, timeout)
     if soft_404_page.response:
@@ -772,7 +859,7 @@ def scan_target(raw_target: str, max_pages: int, timeout: int, scan_ports_enable
                 queue.append(link)
 
     risky_probe_pages = check_risky_files(target, timeout, findings, soft_404_page, soft_404_text)
-    all_response_pages = [soft_404_page] + pages + risky_probe_pages
+    all_response_pages = [soft_404_page] + discovery_pages + pages + risky_probe_pages
     port_results: list[PortResult] = []
     if scan_ports_enabled and parsed_target.hostname:
         ports = parse_ports(custom_ports) if custom_ports.strip() else COMMON_PORTS
@@ -793,6 +880,8 @@ def scan_target(raw_target: str, max_pages: int, timeout: int, scan_ports_enable
         "duration_ms": round((time.time() - started) * 1000),
         "pages": [asdict(page) for page in pages],
         "responses": [asdict(page.response) for page in all_response_pages if page.response],
+        "tls": tls_info,
+        "discovery": discoveries,
         "soft_404_baseline": asdict(soft_404_page.response) if soft_404_page.response else None,
         "ports": [asdict(port) for port in port_results],
         "findings": [asdict(finding) for finding in ordered_findings],
@@ -803,6 +892,7 @@ def scan_target(raw_target: str, max_pages: int, timeout: int, scan_ports_enable
             "identical_hashes": sum(1 for page in all_response_pages if page.response and page.response.identical_response_hash),
             "keyword_matches": sum(1 for page in all_response_pages if page.response and page.response.keyword_matches),
             "ports_open": len(port_results),
+            "discovery": sum(1 for item in discoveries if item["found"]),
             "findings": len(ordered_findings),
             "critical": sum(1 for item in ordered_findings if item.severity == "critical"),
             "high": sum(1 for item in ordered_findings if item.severity == "high"),
@@ -1180,6 +1270,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="summary" id="summary"></div>
       <div class="tabs">
         <button class="tab active" data-view="findings">Findings</button>
+        <button class="tab" data-view="intel">Intel</button>
         <button class="tab" data-view="responses">Responses</button>
         <button class="tab" data-view="pages">Pages</button>
         <button class="tab" data-view="ports">Ports</button>
@@ -1211,7 +1302,8 @@ INDEX_HTML = r"""<!doctype html>
         ["Medium", report.summary.medium],
         ["Low", report.summary.low],
         ["Responses", report.summary.responses || 0],
-        ["Soft 404", report.summary.soft_404 || 0],
+        ["Intel", report.summary.discovery || 0],
+        ["TLS Days", report.tls && report.tls.days_left !== null && report.tls.days_left !== undefined ? report.tls.days_left : "n/a"],
       ];
       summary.innerHTML = items.map(([label, value]) => `<div class="metric"><strong>${value}</strong><span>${label}</span></div>`).join("");
     }
@@ -1277,6 +1369,39 @@ INDEX_HTML = r"""<!doctype html>
       `).join("");
     }
 
+    function renderIntel(report) {
+      const tls = report.tls || {};
+      const discoveries = report.discovery || [];
+      const tlsCard = `
+        <article class="response">
+          <div class="item-title">
+            <span>TLS Certificate</span>
+            <span class="badge ${tls.error ? "medium" : "info"}">${tls.enabled ? "checked" : "n/a"}</span>
+          </div>
+          <div class="detail"><strong>Host:</strong> ${escapeHtml(tls.host || report.target)}</div>
+          ${tls.reason ? `<div class="detail">${escapeHtml(tls.reason)}</div>` : ""}
+          ${tls.error ? `<div class="evidence">${escapeHtml(tls.error)}</div>` : ""}
+          ${tls.issuer ? `<div class="detail"><strong>Issuer:</strong> ${escapeHtml(tls.issuer)}</div>` : ""}
+          ${tls.subject ? `<div class="detail"><strong>Subject:</strong> ${escapeHtml(tls.subject)}</div>` : ""}
+          ${tls.not_after ? `<div class="detail"><strong>Expires:</strong> ${escapeHtml(tls.not_after)} (${escapeHtml(tls.days_left)} day(s))</div>` : ""}
+          ${tls.protocol ? `<div class="detail"><strong>Protocol:</strong> ${escapeHtml(tls.protocol)} ${escapeHtml(tls.cipher || "")}</div>` : ""}
+        </article>
+      `;
+      const discoveryCards = discoveries.map((item) => `
+        <article class="response">
+          <div class="item-title">
+            <span>${escapeHtml(item.label)} ${escapeHtml(item.path)}</span>
+            <span class="badge ${item.found ? "info" : "low"}">${item.found ? "found" : "missing"}</span>
+          </div>
+          <div class="url">${escapeHtml(item.url)}</div>
+          <div class="detail">${escapeHtml(item.status || "error")} ${escapeHtml(item.content_type || "")}</div>
+          ${item.preview ? `<div class="evidence body-preview">${escapeHtml(item.preview)}</div>` : ""}
+        </article>
+      `).join("");
+      output.className = "";
+      output.innerHTML = tlsCard + discoveryCards;
+    }
+
     function renderResponses(report) {
       const responses = report.responses || [];
       if (!responses.length) {
@@ -1319,6 +1444,7 @@ INDEX_HTML = r"""<!doctype html>
       if (activeView === "pages") renderPages(latestReport);
       else if (activeView === "ports") renderPorts(latestReport);
       else if (activeView === "responses") renderResponses(latestReport);
+      else if (activeView === "intel") renderIntel(latestReport);
       else renderFindings(latestReport);
     }
 
