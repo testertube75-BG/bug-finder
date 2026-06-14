@@ -102,7 +102,7 @@ Edit [config.py](config.py) to change runtime defaults.
 | `max_pages_limit` | `unlimited` | Set an integer page count to cap crawls | Maximum crawl page cap |
 | `max_workers` | `unlimited` | Set an integer worker count to cap concurrency | Worker count for concurrent checks |
 | `request_timeout` | `8` | API clamps request values to 2-20 seconds | Default request timeout |
-| `log_level` | `INFO` | `DEBUG`, `INFO`, `LOW`, `MEDIUM`, `HIGH`, `CRITICAL` | Logging level |
+| `log_level` | `INFO` | `DEBUG`, `INFO`, `LOW`, `MEDIUM`, `MIDIUM`, `HIGH`, `CRITICAL` | Logging level |
 | `log_file` | `bug-scout.log` | Optional file path | Optional log file path |
 
 > [!NOTE]
@@ -127,6 +127,17 @@ See [API.md](API.md) for all request and response fields.
 | Browser cannot open app | Confirm the server is running and open `http://127.0.0.1:8765/`. |
 | Scan rejected | Private, loopback, link-local, and multicast targets are blocked by design. |
 | Too many requests | Wait for the rate-limit window to reset, then retry. |
+
+## Roadmap
+
+- [ ] GraphQL support
+- [ ] Custom plugins
+- [ ] Advanced ML detection
+- [ ] Cloud deployment
+- [ ] Team collaboration
+- [ ] Advanced reporting
+- [ ] Show backend server responses in scan output
+- [ ] Add terminal-first workflow so scans can run without opening an external browser
 
 ## Project Files
 
