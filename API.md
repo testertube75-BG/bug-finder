@@ -32,10 +32,10 @@ Scans an authorized web target and returns a JSON security report.
 | Field | Type | Description |
 | --- | --- | --- |
 | `target` | string | Authorized target URL. Missing schemes default to `https://`. |
-| `max_pages` | number | Maximum same-origin pages to crawl. Values are clamped to 1-30. |
+| `max_pages` | number | Maximum same-origin pages to crawl. Unlimited app config means the request value is not capped by a global page limit. |
 | `timeout` | number | Per-request timeout in seconds. Values are clamped to 2-20. |
 | `scan_ports` | boolean | Enables bounded TCP port scanning. |
-| `ports` | string | `common`, empty, comma-separated ports, or ranges like `80,443,8000-8010`. Maximum 100 ports. |
+| `ports` | string | `common`, empty, comma-separated ports, or ranges like `80,443,8000-8010`. Large ranges are allowed when running in unlimited mode. |
 | `ssrf_callback` | string | Optional callback URL recorded in SSRF-related evidence. |
 
 ### Response
@@ -76,7 +76,7 @@ Scans an authorized web target and returns a JSON security report.
 | `summary` | object | Count of pages, responses, findings, discovery items, and severity totals. |
 | `findings` | array | Security findings with `title`, `severity`, `url`, `category`, `detail`, `evidence`, and `remediation`. |
 | `pages` | array | Crawled page objects with URL, status, content type, title, links, forms, scripts, headers, and response analysis. |
-| `responses` | array | Response fingerprints including body preview, hash, file signature, keyword matches, and soft-404 metadata. |
+| `responses` | array | Response fingerprints including decoded response body, hash, file signature, keyword matches, and soft-404 metadata. |
 | `ports` | array | Open TCP ports with port number, service hint, and optional banner. |
 | `discovery` | array | Risky-file discovery responses that were reachable. |
 | `tls` | object | TLS certificate metadata or TLS error details. |
@@ -87,16 +87,16 @@ Scans an authorized web target and returns a JSON security report.
 | --- | --- | --- | --- |
 | `host` | `127.0.0.1` | Any local bind address | Local bind address |
 | `port` | `8765` | Any free local TCP port | Local app port |
-| `max_body_bytes` | `600000` | Bounded by default; unlimited is not recommended | Maximum response body read size |
-| `max_pages_limit` | `30` | Bounded by default; unlimited is not recommended | Maximum crawl page cap |
-| `max_workers` | `5` | Bounded by default; unlimited is not recommended | Worker count for concurrent checks |
+| `max_body_bytes` | `unlimited` | Set an integer byte count to cap reads | Maximum response body read size |
+| `max_pages_limit` | `unlimited` | Set an integer page count to cap crawls | Maximum crawl page cap |
+| `max_workers` | `unlimited` | Set an integer worker count to cap concurrency | Worker count for concurrent checks |
 | `request_timeout` | `8` | API clamps request values to 2-20 seconds | Default request timeout |
-| `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | Logging level |
+| `log_level` | `INFO` | `DEBUG`, `INFO`, `LOW`, `MEDIUM`, `MIDIUM`, `HIGH`, `CRITICAL` | Logging level |
 | `log_file` | `bug-scout.log` | Optional file path | Optional log file path |
 
 ### Errors
 
-`400 Bad Request` is returned for invalid JSON, invalid URLs, private-network targets, invalid ports, or more than 100 requested ports.
+`400 Bad Request` is returned for invalid JSON, invalid URLs, private-network targets, or invalid ports.
 
 `429 Too Many Requests` is returned when a client exceeds the local scan request rate limit.
 

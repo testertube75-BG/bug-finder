@@ -27,10 +27,10 @@ from rate_limiter import RateLimiter
 
 HOST: Final[str] = DEFAULT_CONFIG.host
 PORT: Final[int] = DEFAULT_CONFIG.port
-MAX_BODY_BYTES: Final[int] = DEFAULT_CONFIG.max_body_bytes
-MAX_PAGES_LIMIT: Final[int] = DEFAULT_CONFIG.max_pages_limit
-MAX_PORT_WORKERS: Final[int] = DEFAULT_CONFIG.max_workers
-BODY_PREVIEW_CHARS: Final = 4_000
+MAX_BODY_BYTES: Final[int | None] = DEFAULT_CONFIG.max_body_bytes
+MAX_PAGES_LIMIT: Final[int | None] = DEFAULT_CONFIG.max_pages_limit
+MAX_PORT_WORKERS: Final[int | None] = DEFAULT_CONFIG.max_workers
+BODY_PREVIEW_CHARS: Final[int | None] = DEFAULT_CONFIG.response_preview_chars
 USER_AGENT: Final[str] = "BGBugScout/0.2 authorized-local-scanner"
 
 SEVERITY_ORDER: Final[dict[str, int]] = {
@@ -249,9 +249,12 @@ class ScanConfig:
     ) -> Self:
         """Create a bounded configuration from untrusted user-supplied values."""
 
+        normalized_max_pages = max(1, int(max_pages))
+        if MAX_PAGES_LIMIT is not None:
+            normalized_max_pages = min(normalized_max_pages, MAX_PAGES_LIMIT)
         return cls(
             target=normalize_url(target),
-            max_pages=max(1, min(int(max_pages), MAX_PAGES_LIMIT)),
+            max_pages=normalized_max_pages,
             timeout=max(2, min(int(timeout), 20)),
             scan_ports=bool(scan_ports),
             ports=parse_ports(ports),
@@ -315,12 +318,31 @@ class PageParser(HTMLParser):
         return " ".join(part for part in self.title_parts if part).strip()
 
 
+def normalize_log_level(level: int | str) -> int:
+    """Normalize Python logging levels and user-friendly aliases."""
+
+    if isinstance(level, int):
+        return level
+    aliases = {
+        "LOW": logging.INFO,
+        "MEDIUM": logging.WARNING,
+        "MIDIUM": logging.WARNING,
+        "HIGH": logging.ERROR,
+        "CRITICAL": logging.CRITICAL,
+    }
+    upper = level.strip().upper()
+    if upper in aliases:
+        return aliases[upper]
+    resolved = logging.getLevelName(upper)
+    return resolved if isinstance(resolved, int) else logging.INFO
+
+
 def configure_logging(level: int | str = DEFAULT_CONFIG.log_level) -> None:
     """Configure console and file logging once for local server execution."""
 
     if logging.getLogger().handlers:
         return
-    resolved_level = logging.getLevelName(level) if isinstance(level, str) else level
+    resolved_level = normalize_log_level(level)
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     try:
         handlers.insert(0, logging.FileHandler(DEFAULT_CONFIG.log_file, encoding="utf-8"))
@@ -367,7 +389,7 @@ def parse_bool(value: Any, default: bool = False) -> bool:
 
 
 def parse_ports(raw_ports: str) -> tuple[int, ...]:
-    """Parse comma-separated ports and ranges into a bounded sorted tuple."""
+    """Parse comma-separated ports and ranges into a sorted tuple."""
 
     if not raw_ports.strip() or raw_ports.strip().lower() == "common":
         return COMMON_PORTS
@@ -390,8 +412,6 @@ def parse_ports(raw_ports: str) -> tuple[int, ...]:
     invalid = [port for port in ports if port < 1 or port > 65535]
     if invalid:
         raise TargetError(f"Invalid port number: {invalid[0]}")
-    if len(ports) > 100:
-        raise TargetError("A scan can include at most 100 ports.")
     return tuple(sorted(ports))
 
 
@@ -436,6 +456,14 @@ def build_request(url: str, method: str, data: bytes | None) -> urllib.request.R
     )
 
 
+def read_response_body(response: Any) -> bytes:
+    """Read a response body with the configured maximum size, or all bytes when unlimited."""
+
+    if MAX_BODY_BYTES is None:
+        return response.read()
+    return response.read(MAX_BODY_BYTES)
+
+
 def fetch_page(url: str, timeout: int, method: str = "GET", data: bytes | None = None) -> tuple[PageResult, bytes]:
     """Fetch a URL and return metadata plus a capped response body."""
 
@@ -449,13 +477,13 @@ def fetch_page(url: str, timeout: int, method: str = "GET", data: bytes | None =
             result.headers = {key.lower(): value for key, value in response.headers.items()}
             result.content_type = result.headers.get("content-type", "")
             LOGGER.debug("Fetched %s with status %s", result.url, result.status)
-            return result, response.read(MAX_BODY_BYTES)
+            return result, read_response_body(response)
     except urllib.error.HTTPError as exc:
         result.status = exc.code
         result.headers = {key.lower(): value for key, value in exc.headers.items()}
         result.content_type = result.headers.get("content-type", "")
         LOGGER.info("Fetched HTTP error response from %s: %s", url, exc.code)
-        return result, exc.read(MAX_BODY_BYTES)
+        return result, read_response_body(exc)
     except urllib.error.URLError as exc:
         result.error = f"URLError: {exc.reason}"
         LOGGER.warning("URL fetch failed for %s: %s", url, exc.reason)
@@ -475,10 +503,16 @@ def response_charset(content_type: str) -> str:
     return match.group(1) if match else "utf-8"
 
 
+def decode_body(body: bytes, content_type: str) -> str:
+    """Decode response bytes using the declared charset with UTF-8 fallback."""
+
+    return body.decode(response_charset(content_type), errors="replace")
+
+
 def parse_html(result: PageResult, body: bytes) -> str:
     """Decode a response and parse HTML artifacts when the body looks like HTML."""
 
-    text = body.decode(response_charset(result.content_type), errors="replace")
+    text = decode_body(body, result.content_type)
     if "html" in result.content_type.lower() or re.search(r"<html|<title|<form|<a\s", text, re.IGNORECASE):
         parser = PageParser(result.url)
         parser.feed(text)
@@ -552,7 +586,11 @@ def response_body_preview(body: bytes, body_text: str, content_type: str) -> tup
     if is_probably_text(content_type, body):
         text = body_text or body.decode("utf-8", errors="replace")
         normalized = re.sub(r"\r\n?", "\n", text)
+        if BODY_PREVIEW_CHARS is None:
+            return normalized, False
         return normalized[:BODY_PREVIEW_CHARS], len(normalized) > BODY_PREVIEW_CHARS
+    if BODY_PREVIEW_CHARS is None:
+        return body.hex(" "), False
     return body[:160].hex(" "), len(body) > 160
 
 
@@ -809,6 +847,12 @@ class ContentAnalyzer:
         return detect_file_signature(body, content_type)
 
     @staticmethod
+    def decode(body: bytes, content_type: str) -> str:
+        """Decode a response body using the configured charset fallback logic."""
+
+        return decode_body(body, content_type)
+
+    @staticmethod
     def analyze(page: PageResult, body: bytes, body_text: str) -> ResponseAnalysis:
         """Attach response analysis to a page."""
 
@@ -908,12 +952,12 @@ def scan_port(hostname: str, port: int, timeout: int) -> PortResult:
 
 
 def scan_ports(hostname: str, ports: Iterable[int], timeout: int) -> list[PortResult]:
-    """Scan TCP ports with a bounded worker pool to avoid unbounded concurrency."""
+    """Scan TCP ports with the configured worker count."""
 
     port_list = tuple(ports)
     if not port_list:
         return []
-    worker_count = min(MAX_PORT_WORKERS, len(port_list))
+    worker_count = len(port_list) if MAX_PORT_WORKERS is None else min(MAX_PORT_WORKERS, len(port_list))
     results: list[PortResult] = []
     LOGGER.info("Scanning %s TCP port(s) on %s with %s workers", len(port_list), hostname, worker_count)
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -926,19 +970,19 @@ def scan_ports(hostname: str, ports: Iterable[int], timeout: int) -> list[PortRe
 
 
 class ConcurrentScanner:
-    """Run independent page fetches with a bounded worker pool."""
+    """Run independent page fetches with a configurable worker pool."""
 
-    def __init__(self, max_workers: int = MAX_PORT_WORKERS) -> None:
+    def __init__(self, max_workers: int | None = MAX_PORT_WORKERS) -> None:
         """Create a scanner with an explicit maximum worker count."""
 
-        self.max_workers = max(1, min(max_workers, MAX_PORT_WORKERS))
+        self.max_workers = max_workers
 
     def scan_multiple(self, urls: list[str], timeout: int = DEFAULT_CONFIG.request_timeout) -> list[PageResult]:
         """Fetch and analyze multiple URLs concurrently."""
 
         if not urls:
             return []
-        worker_count = min(self.max_workers, len(urls))
+        worker_count = len(urls) if self.max_workers is None else max(1, min(self.max_workers, len(urls)))
         results: list[PageResult] = []
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {executor.submit(fetch_analyzed_page, url, timeout): url for url in urls}
@@ -1223,7 +1267,7 @@ class ScoutHandler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("content-length", "0"))
-            if length > MAX_BODY_BYTES:
+            if MAX_BODY_BYTES is not None and length > MAX_BODY_BYTES:
                 self.send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "Request body too large."})
                 return
             payload = json.loads(self.rfile.read(length) or b"{}")
@@ -1303,7 +1347,7 @@ INDEX_HTML = r"""<!doctype html>
   <main class="wrap">
     <section class="panel">
       <label for="target">Authorized target URL</label><input id="target" placeholder="https://example.com" autocomplete="off">
-      <div class="row"><div><label for="maxPages">Max pages</label><input id="maxPages" type="number" min="1" max="30" value="8"></div><div><label for="timeout">Timeout sec</label><input id="timeout" type="number" min="2" max="20" value="8"></div></div>
+      <div class="row"><div><label for="maxPages">Max pages</label><input id="maxPages" type="number" min="1" value="8"></div><div><label for="timeout">Timeout sec</label><input id="timeout" type="number" min="2" max="20" value="8"></div></div>
       <div class="checkrow"><input id="scanPorts" type="checkbox" checked><span>Auto port scan</span></div>
       <label for="ports" style="margin-top:14px">Ports</label><input id="ports" placeholder="common, or 80,443,8000-8010">
       <label for="ssrf" style="margin-top:14px">SSRF callback URL</label><input id="ssrf" placeholder="optional https://your-callback.example/id">

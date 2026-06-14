@@ -16,8 +16,8 @@ BG Bug Scout is a local web security scanner for authorized targets. It crawls p
 | --- | --- |
 | Web checks | Header checks, content fingerprints, risky file discovery, soft-404 signals |
 | Response analysis | Content-Type validation, file signatures, keyword indicators, duplicate hash detection |
-| Port scan | Bounded `ThreadPoolExecutor` scanning with configurable port lists |
-| Safety | Private-network target blocking, body-size limits, rate limiting |
+| Port scan | Configurable `ThreadPoolExecutor` scanning with custom port lists |
+| Safety | Private-network target blocking, rate limiting |
 | Quality | Type hints, custom exceptions, logging, unit tests, CI workflow |
 
 ## Run Step by Step
@@ -98,15 +98,15 @@ Edit [config.py](config.py) to change runtime defaults.
 | --- | --- | --- | --- |
 | `host` | `127.0.0.1` | Any local bind address | Local bind address |
 | `port` | `8765` | Any free local TCP port | Local app port |
-| `max_body_bytes` | `600000` | Bounded by default; do not set unlimited for untrusted targets | Maximum response body read size |
-| `max_pages_limit` | `30` | Bounded by default; higher values increase crawl time | Maximum crawl page cap |
-| `max_workers` | `5` | Bounded by default; higher values increase concurrency | Worker count for concurrent checks |
+| `max_body_bytes` | `unlimited` | Set an integer byte count to cap reads | Maximum response body read size |
+| `max_pages_limit` | `unlimited` | Set an integer page count to cap crawls | Maximum crawl page cap |
+| `max_workers` | `unlimited` | Set an integer worker count to cap concurrency | Worker count for concurrent checks |
 | `request_timeout` | `8` | API clamps request values to 2-20 seconds | Default request timeout |
-| `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | Logging level |
+| `log_level` | `INFO` | `DEBUG`, `INFO`, `LOW`, `MEDIUM`, `MIDIUM`, `HIGH`, `CRITICAL` | Logging level |
 | `log_file` | `bug-scout.log` | Optional file path | Optional log file path |
 
 > [!NOTE]
-> Unlimited response size, crawl pages, or workers can make a scan slow or unstable. The app keeps bounded defaults for safety and predictable local performance.
+> Unlimited response size, crawl pages, and workers are enabled by default because this project is intended for local authorized testing. Use integer caps in `config.py` when scanning large targets.
 
 ## HTTP Methods
 

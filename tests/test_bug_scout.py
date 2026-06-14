@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app import detect_file_signature, normalize_url, parse_ports, response_similarity
+from app import decode_body, detect_file_signature, normalize_url, parse_ports, response_similarity
 
 
 class TestBugScout(unittest.TestCase):
@@ -41,11 +41,18 @@ class TestBugScout(unittest.TestCase):
         self.assertIn(80, ports)
         self.assertIn(8005, ports)
 
-    def test_parse_ports_limit(self) -> None:
-        """Reject scans over 100 ports."""
+    def test_parse_ports_unlimited_range(self) -> None:
+        """Allow large port ranges when configuration is unlimited."""
 
-        with self.assertRaises(ValueError):
-            parse_ports("1-300")
+        ports = parse_ports("1-300")
+        self.assertEqual(len(ports), 300)
+        self.assertIn(300, ports)
+
+    def test_decode_body_uses_declared_charset(self) -> None:
+        """Decode response bytes with the declared response charset."""
+
+        result = decode_body("cafe".encode("utf-16"), "text/plain; charset=utf-16")
+        self.assertEqual(result, "cafe")
 
 
 if __name__ == "__main__":
