@@ -36,7 +36,7 @@
 
 | Layer | What It Does |
 | --- | --- |
-| **Web Checks** | Header checks, content fingerprints, risky file discovery, GraphQL probes, and soft-404 signals |
+| **Web Checks** | Header checks, XSS types, CSD/CSP/CORS checks, SSRF signals, risky file discovery, GraphQL probes, and soft-404 signals |
 | **Response Analysis** | Decoded backend response body, Content-Type validation, file signatures, keywords, duplicate hashes |
 | **Advanced Detection** | Local ML-style heuristic scoring and plugin-powered custom findings |
 | **Reports** | JSON, CSV, and standalone HTML exports |
@@ -80,6 +80,15 @@ http://127.0.0.1:8765/
 3. Click **Run safe scan**.
 4. Review **Findings**, **Intel**, **Responses**, **Pages**, and **Ports**.
 5. Export as **JSON**, **CSV**, or **HTML**.
+
+Findings include PoC details when available, including:
+
+- Reflected XSS probe URL and payload
+- DOM XSS source/sink pattern
+- Stored-XSS-like rendered markup signal
+- SSRF parameter name and callback validation note
+- CSD/CSP/CORS header evidence
+- CSRF token absence on POST forms
 
 Port scan results show nmap-style details for each scanned TCP port:
 

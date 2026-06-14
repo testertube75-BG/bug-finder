@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app import Finding, MLDetector, ResponseAnalysis, build_arg_parser, build_update_plan, findings_to_csv, infer_service_version, normalize_url, parse_ports, report_to_html, service_hint, ScanConfig, TargetError
+from app import Finding, MLDetector, PageResult, ResponseAnalysis, build_arg_parser, build_reflected_xss_probe_urls, build_update_plan, check_client_side_defenses, check_xss_indicators, detect_dom_xss_sinks, findings_to_csv, infer_service_version, normalize_url, parse_ports, report_to_html, service_hint, ScanConfig, TargetError
 from rate_limiter import RateLimiter
 
 
@@ -83,9 +83,40 @@ class TestScanConfig(unittest.TestCase):
     def test_report_to_html_exports_document(self) -> None:
         """Reports can be exported as standalone HTML."""
 
-        html_text = report_to_html({"target": "https://example.com", "findings": [{"severity": "info", "title": "T", "url": "u", "detail": "d"}]})
+        html_text = report_to_html({"target": "https://example.com", "findings": [{"severity": "info", "title": "T", "url": "u", "detail": "d", "poc": "proof"}]})
         self.assertIn("<!doctype html>", html_text)
         self.assertIn("https://example.com", html_text)
+        self.assertIn("proof", html_text)
+
+    def test_dom_xss_sink_detection(self) -> None:
+        """DOM XSS sink/source patterns are detected."""
+
+        sinks = detect_dom_xss_sinks("const x = location.hash; el.innerHTML = x;")
+        self.assertIn("location hash/source", sinks)
+        self.assertIn("innerHTML", sinks)
+
+    def test_check_xss_indicators_adds_dom_finding(self) -> None:
+        """DOM XSS indicators create a finding with PoC."""
+
+        findings: list[Finding] = []
+        check_xss_indicators(PageResult("https://example.com"), "const x = location.hash; el.innerHTML = x;", findings)
+        self.assertEqual(findings[0].category, "xss-dom")
+        self.assertTrue(findings[0].poc)
+
+    def test_reflected_xss_probe_url_builder(self) -> None:
+        """Query parameters produce reflected-XSS probe URLs."""
+
+        probes = build_reflected_xss_probe_urls(PageResult("https://example.com/search?q=test"))
+        self.assertIn("bg-xss", probes[0])
+
+    def test_weak_csp_detection_adds_poc(self) -> None:
+        """Weak CSP headers produce CSD findings with PoC."""
+
+        page = PageResult("https://example.com", headers={"content-security-policy": "script-src 'unsafe-inline'"})
+        findings: list[Finding] = []
+        check_client_side_defenses(page, findings)
+        self.assertEqual(findings[0].category, "csd")
+        self.assertIn("Content-Security-Policy", findings[0].poc)
 
     def test_cli_parser_accepts_terminal_mode(self) -> None:
         """CLI parser supports terminal-only scan arguments."""

@@ -122,8 +122,21 @@ class FindingTests(unittest.TestCase):
 
         app.check_forms(page, findings, "")
 
-        self.assertEqual(findings[0].title, "SSRF-sensitive parameter name in form")
-        self.assertEqual(findings[0].severity, "info")
+        ssrf_findings = [finding for finding in findings if finding.title == "SSRF-sensitive parameter name in form"]
+        self.assertEqual(ssrf_findings[0].severity, "info")
+        self.assertIn("callback URL", ssrf_findings[0].poc)
+
+    def test_check_forms_flags_missing_csrf_token(self) -> None:
+        page = app.PageResult(
+            "https://example.com",
+            forms=[{"action": "https://example.com/update", "method": "POST", "inputs": [{"name": "email"}]}],
+        )
+        findings: list[app.Finding] = []
+
+        app.check_forms(page, findings, "")
+
+        self.assertEqual(findings[0].title, "POST form missing obvious CSRF token")
+        self.assertEqual(findings[0].category, "csrf")
 
     def test_summarize_counts_severities_and_artifacts(self) -> None:
         findings = [

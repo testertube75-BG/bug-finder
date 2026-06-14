@@ -105,6 +105,18 @@ RISKY_FILES: Final[tuple[str, ...]] = (
 )
 GRAPHQL_PATHS: Final[tuple[str, ...]] = ("/graphql", "/api/graphql", "/graphiql", "/playground")
 PLUGIN_DIR: Final[Path] = Path("plugins")
+XSS_TEST_PAYLOAD: Final[str] = "<svg/onload=alert('bg-xss')>"
+XSS_CANARY: Final[str] = "bg-xss"
+CSRF_TOKEN_NAMES: Final[set[str]] = {"csrf", "csrf_token", "_csrf", "authenticity_token", "xsrf", "xsrf_token", "_token"}
+DANGEROUS_JS_SINKS: Final[dict[str, str]] = {
+    "innerHTML": r"\.innerHTML\s*=",
+    "outerHTML": r"\.outerHTML\s*=",
+    "document.write": r"\bdocument\.write\s*\(",
+    "eval": r"\beval\s*\(",
+    "Function constructor": r"\bnew\s+Function\s*\(",
+    "insertAdjacentHTML": r"\binsertAdjacentHTML\s*\(",
+    "location hash/source": r"\b(location\.(hash|search|href)|document\.URL|document\.referrer)\b",
+}
 SSRF_PARAM_NAMES: Final[set[str]] = {
     "url",
     "uri",
@@ -195,6 +207,7 @@ class Finding:
     category: str
     detail: str
     evidence: str = ""
+    poc: str = ""
     remediation: str = ""
 
 
@@ -698,6 +711,182 @@ def check_headers(page: PageResult, findings: list[Finding]) -> None:
             detail="HTTPS responses should advertise Strict-Transport-Security.",
             remediation="Send Strict-Transport-Security after confirming HTTPS is stable across the site.",
         )
+    check_client_side_defenses(page, findings)
+
+
+def check_client_side_defenses(page: PageResult, findings: list[Finding]) -> None:
+    """Check CSP/CORS client-side defense settings that affect XSS impact."""
+
+    headers = page.headers
+    csp = headers.get("content-security-policy", "")
+    if csp:
+        lowered = csp.lower()
+        risky_tokens = [token for token in ("'unsafe-inline'", "'unsafe-eval'", "data:", "*") if token in lowered]
+        if risky_tokens:
+            add_finding(
+                findings,
+                title="Weak Content Security Policy",
+                severity="medium",
+                url=page.url,
+                category="csd",
+                detail="The CSP contains directives that can weaken XSS protection.",
+                evidence=", ".join(risky_tokens),
+                poc=f"Observed Content-Security-Policy: {csp}",
+                remediation="Avoid unsafe-inline/unsafe-eval, restrict script-src to trusted origins, and use nonces or hashes.",
+            )
+    cors_origin = headers.get("access-control-allow-origin", "")
+    cors_credentials = headers.get("access-control-allow-credentials", "").lower()
+    if cors_origin == "*" and cors_credentials == "true":
+        add_finding(
+            findings,
+            title="Dangerous CORS policy",
+            severity="high",
+            url=page.url,
+            category="csd",
+            detail="The response allows any origin while also allowing credentials.",
+            evidence="Access-Control-Allow-Origin=*; Access-Control-Allow-Credentials=true",
+            poc="curl -I <url> and confirm both CORS headers are present together.",
+            remediation="Use an explicit allowlist of trusted origins and avoid wildcard origins for credentialed requests.",
+        )
+
+
+def detect_dom_xss_sinks(body_text: str) -> list[str]:
+    """Return JavaScript sink/source patterns that may indicate DOM XSS risk."""
+
+    matches: list[str] = []
+    for label, pattern in DANGEROUS_JS_SINKS.items():
+        if re.search(pattern, body_text, re.IGNORECASE):
+            matches.append(label)
+    return matches
+
+
+def detect_stored_xss_signals(body_text: str) -> list[str]:
+    """Return stored-XSS-like signals from rendered HTML content."""
+
+    signals: list[str] = []
+    if re.search(r"<script\b[^>]*>.*?</script>", body_text, re.IGNORECASE | re.DOTALL):
+        signals.append("script tag in rendered content")
+    if re.search(r"\son\w+\s*=", body_text, re.IGNORECASE):
+        signals.append("inline event handler")
+    if re.search(r"javascript\s*:", body_text, re.IGNORECASE):
+        signals.append("javascript URL")
+    return signals
+
+
+def check_xss_indicators(page: PageResult, body_text: str, findings: list[Finding]) -> None:
+    """Detect DOM and stored-XSS indicators from fetched content."""
+
+    if page.error or not body_text:
+        return
+    sinks = detect_dom_xss_sinks(body_text)
+    if {"location hash/source", "innerHTML"} <= set(sinks) or {"location hash/source", "document.write"} <= set(sinks):
+        add_finding(
+            findings,
+            title="DOM XSS sink/source pattern",
+            severity="medium",
+            url=page.url,
+            category="xss-dom",
+            detail="The page references controllable browser sources and writes to dangerous HTML sinks.",
+            evidence=", ".join(sinks),
+            poc=f"Review JavaScript on {page.url} for source-to-sink flow: {', '.join(sinks)}",
+            remediation="Use textContent/safe DOM APIs, sanitize untrusted values, and avoid writing URL-derived values into HTML.",
+        )
+    signals = detect_stored_xss_signals(body_text)
+    if signals:
+        add_finding(
+            findings,
+            title="Stored XSS indicator in rendered content",
+            severity="info",
+            url=page.url,
+            category="xss-stored",
+            detail="The rendered page contains script-like markup that should be reviewed for stored XSS.",
+            evidence=", ".join(signals[:5]),
+            poc=f"Open {page.url} and inspect whether the script-like markup comes from stored user-controlled content.",
+            remediation="Ensure stored user-controlled content is contextually escaped before rendering.",
+        )
+
+
+def parameter_names_from_url(url: str) -> set[str]:
+    """Extract lowercase query parameter names from a URL."""
+
+    parsed = urllib.parse.urlparse(url)
+    return {name.lower() for name in urllib.parse.parse_qs(parsed.query)}
+
+
+def check_ssrf_url_parameters(page: PageResult, findings: list[Finding], ssrf_callback: str) -> None:
+    """Detect SSRF-sensitive query parameter names in URLs and links."""
+
+    urls = [page.url, *page.links]
+    for url in urls:
+        risky = sorted(parameter_names_from_url(url) & SSRF_PARAM_NAMES)
+        if not risky:
+            continue
+        evidence = ", ".join(risky)
+        if ssrf_callback:
+            evidence = f"{evidence}; callback configured for authorized validation: {ssrf_callback}"
+        add_finding(
+            findings,
+            title="SSRF-sensitive URL parameter",
+            severity="info",
+            url=url,
+            category="ssrf",
+            detail="A URL contains destination-like parameters that often need SSRF protection.",
+            evidence=evidence,
+            poc=f"Replace {', '.join(risky)} with an authorized callback URL and confirm whether the backend requests it.",
+            remediation="Validate outbound destinations with an allowlist and block private, loopback, link-local, and metadata IP ranges.",
+        )
+
+
+def build_reflected_xss_probe_urls(page: PageResult) -> list[str]:
+    """Build safe reflected-XSS probe URLs from query parameters and GET forms."""
+
+    probes: list[str] = []
+    parsed = urllib.parse.urlparse(page.url)
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    if query:
+        mutated = {key: [XSS_TEST_PAYLOAD] for key in query}
+        probes.append(urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(mutated, doseq=True))))
+    for form in page.forms:
+        if str(form.get("method", "GET")).upper() != "GET":
+            continue
+        action = str(form.get("action", page.url))
+        inputs = form.get("inputs", [])
+        values = {str(item.get("name", "q")): XSS_TEST_PAYLOAD for item in inputs if item.get("name")}
+        if values:
+            form_parsed = urllib.parse.urlparse(action)
+            probes.append(urllib.parse.urlunparse(form_parsed._replace(query=urllib.parse.urlencode(values))))
+    return sorted(set(probes))[:10]
+
+
+def check_reflected_xss(page: PageResult, timeout: int, findings: list[Finding]) -> None:
+    """Send non-destructive canary probes to detect reflected XSS candidates."""
+
+    for probe_url in build_reflected_xss_probe_urls(page):
+        probe_page, probe_text = fetch_analyzed_page(probe_url, timeout)
+        if probe_page.error or not probe_text:
+            continue
+        reflected_raw = XSS_TEST_PAYLOAD in probe_text
+        reflected_canary = XSS_CANARY in probe_text
+        escaped_payload = html.escape(XSS_TEST_PAYLOAD) in probe_text
+        if reflected_raw:
+            severity = "high"
+            evidence = "raw payload reflected"
+        elif reflected_canary and not escaped_payload:
+            severity = "medium"
+            evidence = "canary reflected without expected HTML escaping"
+        else:
+            continue
+        add_finding(
+            findings,
+            title="Reflected XSS probe reflection",
+            severity=severity,
+            url=probe_url,
+            category="xss-reflected",
+            detail="A safe XSS canary was reflected in the response.",
+            evidence=evidence,
+            poc=f"Probe URL: {probe_url}; payload: {XSS_TEST_PAYLOAD}",
+            remediation="Contextually encode reflected input and validate user-controlled parameters.",
+        )
 
 
 def check_response_analysis(page: PageResult, findings: list[Finding]) -> None:
@@ -838,6 +1027,7 @@ def check_forms(page: PageResult, findings: list[Finding], ssrf_callback: str) -
         action = str(form.get("action", page.url))
         method = str(form.get("method", "GET")).upper()
         inputs = form.get("inputs", [])
+        input_names = {str(input_item.get("name", "")).lower() for input_item in inputs}
         if urllib.parse.urlparse(action).scheme == "http":
             add_finding(
                 findings,
@@ -847,6 +1037,18 @@ def check_forms(page: PageResult, findings: list[Finding], ssrf_callback: str) -
                 category="forms",
                 detail="A form action uses cleartext HTTP.",
                 remediation="Submit sensitive forms over HTTPS.",
+            )
+        if method == "POST" and not (input_names & CSRF_TOKEN_NAMES):
+            add_finding(
+                findings,
+                title="POST form missing obvious CSRF token",
+                severity="medium",
+                url=action,
+                category="csrf",
+                detail="A POST form does not include a common anti-CSRF token field name.",
+                evidence=f"inputs={', '.join(sorted(input_names)) or 'none'}",
+                poc=f"Submit the form from a separate authorized test page and confirm whether the request is accepted without a CSRF token.",
+                remediation="Add server-validated CSRF tokens or same-site protections for state-changing forms.",
             )
         risky_inputs = sorted(
             str(input_item.get("name", "")).lower()
@@ -865,6 +1067,7 @@ def check_forms(page: PageResult, findings: list[Finding], ssrf_callback: str) -
                 category="forms",
                 detail=f"A {method} form includes URL/path-like parameter names.",
                 evidence=evidence,
+                poc=f"Set {', '.join(risky_inputs)} to an authorized callback URL and confirm whether the backend fetches it.",
                 remediation="Validate destinations with an allowlist and block private network ranges.",
             )
 
@@ -1011,10 +1214,11 @@ class ContentAnalyzer:
 class SecurityChecker:
     """Encapsulate page-level security checks and finding collection."""
 
-    def __init__(self, ssrf_callback: str = "") -> None:
+    def __init__(self, ssrf_callback: str = "", timeout: int = DEFAULT_CONFIG.request_timeout) -> None:
         """Create a checker with optional SSRF callback context for evidence notes."""
 
         self.ssrf_callback = ssrf_callback
+        self.timeout = timeout
         self.findings: list[Finding] = []
 
     def check_all(
@@ -1030,6 +1234,8 @@ class SecurityChecker:
         self.check_page_content(page, body_text)
         self.check_response_analysis(page)
         self.check_forms(page)
+        check_ssrf_url_parameters(page, self.findings, self.ssrf_callback)
+        check_reflected_xss(page, self.timeout, self.findings)
         if soft_404_baseline:
             mark_soft_404(page, body_text, soft_404_baseline, soft_404_text)
         return self.findings
@@ -1044,6 +1250,7 @@ class SecurityChecker:
 
         if page.status and page.status >= 500 and body_text:
             LOGGER.debug("Server-error page content captured for %s", page.url)
+        check_xss_indicators(page, body_text, self.findings)
 
     def check_response_analysis(self, page: PageResult) -> None:
         """Check normalized response analysis for risky content."""
@@ -1352,7 +1559,7 @@ def findings_to_csv(findings: Iterable[Mapping[str, Any]]) -> str:
     """Serialize findings to CSV for terminal and browser export."""
 
     output = io.StringIO()
-    fieldnames = ["severity", "title", "url", "category", "detail", "evidence", "remediation"]
+    fieldnames = ["severity", "title", "url", "category", "detail", "evidence", "poc", "remediation"]
     writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for finding in findings:
@@ -1370,6 +1577,7 @@ def report_to_html(report: Mapping[str, Any]) -> str:
         f"<td>{html.escape(str(item.get('title', '')))}</td>"
         f"<td>{html.escape(str(item.get('url', '')))}</td>"
         f"<td>{html.escape(str(item.get('detail', '')))}</td>"
+        f"<td>{html.escape(str(item.get('poc', '')))}</td>"
         "</tr>"
         for item in findings
         if isinstance(item, Mapping)
@@ -1393,7 +1601,7 @@ def report_to_html(report: Mapping[str, Any]) -> str:
   <p><strong>Scanned at:</strong> {html.escape(str(report.get("scanned_at", "")))}</p>
   <h2>Findings</h2>
   <table>
-    <thead><tr><th>Severity</th><th>Title</th><th>URL</th><th>Detail</th></tr></thead>
+    <thead><tr><th>Severity</th><th>Title</th><th>URL</th><th>Detail</th><th>PoC</th></tr></thead>
     <tbody>{rows}</tbody>
   </table>
 </body>
@@ -1549,7 +1757,7 @@ def scan_target(
         baseline_path = f"/__bg_bug_scout_missing_{hashlib.sha1(config.target.encode()).hexdigest()[:12]}"
         baseline_page, baseline_text = fetch_analyzed_page(config.target.rstrip("/") + baseline_path, config.timeout)
 
-        checker = SecurityChecker(config.ssrf_callback)
+        checker = SecurityChecker(config.ssrf_callback, config.timeout)
         checker.findings.extend(findings)
         for page in all_response_pages:
             body_text = body_texts.get(page.url, "")
@@ -1790,7 +1998,7 @@ INDEX_HTML = r"""<!doctype html>
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
     function renderSummary(report) { if (!report) { summary.innerHTML = ""; return; } const items = [["Critical", report.summary.critical], ["High", report.summary.high], ["Medium", report.summary.medium], ["Low", report.summary.low], ["Responses", report.summary.responses || 0], ["Intel", report.summary.discovery || 0]]; summary.innerHTML = items.map(([label, value]) => `<div class="metric"><strong>${value}</strong><span>${label}</span></div>`).join(""); }
     function card(title, badge, body, klass = "response") { return `<article class="${klass}"><div class="item-title"><span>${escapeHtml(title)}</span><span class="badge ${escapeHtml(badge)}">${escapeHtml(badge)}</span></div>${body}</article>`; }
-    function renderFindings(report) { if (!report.findings.length) { output.className = "empty"; output.textContent = "No findings from these checks."; return; } output.className = ""; output.innerHTML = report.findings.map((finding) => card(finding.title, finding.severity, `<div class="url">${escapeHtml(finding.url)}</div><div class="detail">${escapeHtml(finding.category)}: ${escapeHtml(finding.detail)}</div>${finding.evidence ? `<div class="evidence">${escapeHtml(finding.evidence)}</div>` : ""}${finding.remediation ? `<div class="remediation"><strong>Fix:</strong> ${escapeHtml(finding.remediation)}</div>` : ""}`, "finding")).join(""); }
+    function renderFindings(report) { if (!report.findings.length) { output.className = "empty"; output.textContent = "No findings from these checks."; return; } output.className = ""; output.innerHTML = report.findings.map((finding) => card(finding.title, finding.severity, `<div class="url">${escapeHtml(finding.url)}</div><div class="detail">${escapeHtml(finding.category)}: ${escapeHtml(finding.detail)}</div>${finding.evidence ? `<div class="evidence">${escapeHtml(finding.evidence)}</div>` : ""}${finding.poc ? `<div class="evidence"><strong>PoC:</strong> ${escapeHtml(finding.poc)}</div>` : ""}${finding.remediation ? `<div class="remediation"><strong>Fix:</strong> ${escapeHtml(finding.remediation)}</div>` : ""}`, "finding")).join(""); }
     function renderPages(report) { if (!report.pages.length) { output.className = "empty"; output.textContent = "No pages crawled."; return; } output.className = ""; output.innerHTML = report.pages.map((page) => card(page.title || "Untitled page", "info", `<div class="url">${escapeHtml(page.url)}</div>${page.error ? `<div class="detail">${escapeHtml(page.error)}</div>` : ""}<div class="detail">${escapeHtml(page.status || "error")} ${escapeHtml(page.content_type || "unknown content type")}</div><div class="detail">${page.links.length} link(s), ${page.forms.length} form(s), ${page.scripts.length} script(s)</div>`, "page")).join(""); }
     function renderPorts(report) { if (!report.ports.length) { output.className = "empty"; output.textContent = "No port scan results captured."; return; } output.className = ""; output.innerHTML = report.ports.map((port) => card(`${escapeHtml(port.host || "")}:${escapeHtml(port.port)}/${escapeHtml(port.protocol || "tcp")}`, port.open ? "info" : "low", `<div class="detail"><strong>State:</strong> ${escapeHtml(port.state)} (${escapeHtml(port.reason || "unknown")})</div><div class="detail"><strong>Service:</strong> ${escapeHtml(port.service_hint || "unknown")} ${escapeHtml(port.service_version || "")}</div><div class="detail"><strong>Latency:</strong> ${escapeHtml(port.latency_ms || 0)}ms</div>${port.banner ? `<div class="evidence">${escapeHtml(port.banner)}</div>` : ""}`, "port")).join(""); }
     function renderIntel(report) { const tls = report.tls || {}, discoveries = report.discovery || []; output.className = ""; output.innerHTML = card("TLS Certificate", tls.error ? "medium" : "info", `<div class="detail"><strong>Host:</strong> ${escapeHtml(tls.host || report.target)}</div>${tls.reason ? `<div class="detail">${escapeHtml(tls.reason)}</div>` : ""}${tls.error ? `<div class="evidence">${escapeHtml(tls.error)}</div>` : ""}${tls.not_after ? `<div class="detail"><strong>Expires:</strong> ${escapeHtml(tls.not_after)}</div>` : ""}`) + discoveries.map((item) => card(`${item.url}`, item.status && item.status < 404 ? "info" : "low", `<div class="detail">${escapeHtml(item.status || "error")} ${escapeHtml(item.content_type || "")}</div>`)).join(""); }

@@ -77,7 +77,7 @@ Scans an authorized web target and returns a JSON security report.
 | `duration_ms` | number | Scan duration in milliseconds. |
 | `elapsed_ms` | number | Backward-compatible alias for `duration_ms`. |
 | `summary` | object | Count of pages, responses, findings, discovery items, and severity totals. |
-| `findings` | array | Security findings with `title`, `severity`, `url`, `category`, `detail`, `evidence`, and `remediation`. |
+| `findings` | array | Security findings with `title`, `severity`, `url`, `category`, `detail`, `evidence`, `poc`, and `remediation`. |
 | `pages` | array | Crawled page objects with URL, status, content type, title, links, forms, scripts, headers, and response analysis. |
 | `responses` | array | Response fingerprints including decoded response body, hash, file signature, keyword matches, and soft-404 metadata. |
 | `ports` | array | Nmap-style TCP port results including host, port, protocol, state, reason, latency, service hint, version guess, and optional banner. |
@@ -88,6 +88,8 @@ Scans an authorized web target and returns a JSON security report.
 | `exports` | object | `findings_csv` and `html_report` export payloads. |
 
 ### Export Formats
+
+Findings include PoC text when the scanner can provide a safe proof point, such as reflected-XSS probe URL, DOM XSS source/sink pattern, SSRF parameter/callback note, weak CSP/CORS headers, or missing CSRF token evidence.
 
 The web UI can download:
 
