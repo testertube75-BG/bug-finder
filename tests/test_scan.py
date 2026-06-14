@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app import ScanConfig, TargetError, normalize_url, parse_ports
+from app import Finding, MLDetector, ResponseAnalysis, build_arg_parser, findings_to_csv, normalize_url, parse_ports, report_to_html, ScanConfig, TargetError
 from rate_limiter import RateLimiter
 
 
@@ -49,6 +49,33 @@ class TestScanConfig(unittest.TestCase):
         self.assertTrue(limiter.is_allowed("127.0.0.1"))
         self.assertTrue(limiter.is_allowed("127.0.0.1"))
         self.assertFalse(limiter.is_allowed("127.0.0.1"))
+
+    def test_ml_detector_scores_secret_response(self) -> None:
+        """MLDetector raises score for secret-like responses."""
+
+        response = ResponseAnalysis(url="https://example.com", file_signature="dotenv/config file", keyword_matches=["secret"])
+        self.assertGreaterEqual(MLDetector.score_response(response), 75)
+
+    def test_findings_to_csv_exports_rows(self) -> None:
+        """Findings can be exported to CSV."""
+
+        csv_text = findings_to_csv([{"title": "Title", "severity": "info", "url": "https://example.com", "category": "test", "detail": "detail"}])
+        self.assertIn("severity,title,url", csv_text)
+        self.assertIn("Title", csv_text)
+
+    def test_report_to_html_exports_document(self) -> None:
+        """Reports can be exported as standalone HTML."""
+
+        html_text = report_to_html({"target": "https://example.com", "findings": [{"severity": "info", "title": "T", "url": "u", "detail": "d"}]})
+        self.assertIn("<!doctype html>", html_text)
+        self.assertIn("https://example.com", html_text)
+
+    def test_cli_parser_accepts_terminal_mode(self) -> None:
+        """CLI parser supports terminal-only scan arguments."""
+
+        args = build_arg_parser().parse_args(["--target", "example.com", "--output", "json"])
+        self.assertEqual(args.target, "example.com")
+        self.assertEqual(args.output, "json")
 
 
 if __name__ == "__main__":

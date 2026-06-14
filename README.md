@@ -14,8 +14,10 @@ BG Bug Scout is a local web security scanner for authorized targets. It crawls p
 
 | Area | Included |
 | --- | --- |
-| Web checks | Header checks, content fingerprints, risky file discovery, soft-404 signals |
+| Web checks | Header checks, content fingerprints, risky file discovery, GraphQL probes, soft-404 signals |
 | Response analysis | Content-Type validation, file signatures, keyword indicators, duplicate hash detection |
+| Advanced detection | Local ML-style heuristic scoring and custom plugin hooks |
+| Reports | JSON, CSV, and standalone HTML exports |
 | Port scan | Configurable `ThreadPoolExecutor` scanning with custom port lists |
 | Safety | Private-network target blocking, rate limiting |
 | Quality | Type hints, custom exceptions, logging, unit tests, CI workflow |
@@ -78,6 +80,41 @@ curl -X POST http://127.0.0.1:8765/api/scan \
 
 More details are in [API.md](API.md).
 
+## Terminal-Only Mode
+
+Run scans without opening an external browser:
+
+```bash
+python app.py --target https://example.com --max-pages 1 --output text
+```
+
+Export JSON, CSV, or HTML from the terminal:
+
+```bash
+python app.py --target https://example.com --output json
+python app.py --target https://example.com --output csv
+python app.py --target https://example.com --output html --output-file report.html
+```
+
+## Custom Plugins
+
+Create Python files in a local `plugins/` folder. A plugin can expose `analyze_page(page, body_text)` and return `Finding` objects or dictionaries with Finding fields.
+
+```python
+def analyze_page(page, body_text):
+    if "example" in body_text.lower():
+        return [{
+            "title": "Plugin keyword match",
+            "severity": "info",
+            "url": page.url,
+            "category": "plugin",
+            "detail": "The custom plugin matched response text.",
+        }]
+    return []
+```
+
+Plugins may also expose `finalize_report(report)` to add metadata after the scan.
+
 ## Run Tests
 
 ```bash
@@ -130,14 +167,14 @@ See [API.md](API.md) for all request and response fields.
 
 ## Roadmap
 
-- [ ] GraphQL support
-- [ ] Custom plugins
-- [ ] Advanced ML detection
+- [x] GraphQL support
+- [x] Custom plugins
+- [x] Advanced ML detection
 - [ ] Cloud deployment
 - [ ] Team collaboration
-- [ ] Advanced reporting
-- [ ] Show backend server responses in scan output
-- [ ] Add terminal-first workflow so scans can run without opening an external browser
+- [x] Advanced reporting
+- [x] Show backend server responses in scan output
+- [x] Add terminal-first workflow so scans can run without opening an external browser
 
 ## Project Files
 

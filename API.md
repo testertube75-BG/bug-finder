@@ -79,7 +79,38 @@ Scans an authorized web target and returns a JSON security report.
 | `responses` | array | Response fingerprints including decoded response body, hash, file signature, keyword matches, and soft-404 metadata. |
 | `ports` | array | Open TCP ports with port number, service hint, and optional banner. |
 | `discovery` | array | Risky-file discovery responses that were reachable. |
+| `graphql` | array | Common GraphQL endpoint probes that looked reachable or GraphQL-like. |
 | `tls` | object | TLS certificate metadata or TLS error details. |
+| `plugins` | array | Names of loaded custom plugin modules. |
+| `exports` | object | `findings_csv` and `html_report` export payloads. |
+
+### Export Formats
+
+The web UI can download:
+
+| Format | Content |
+| --- | --- |
+| JSON | Full scan report including responses and exports |
+| CSV | Findings table for spreadsheets |
+| HTML | Standalone report for sharing or archiving |
+
+Terminal mode supports the same formats:
+
+```bash
+python app.py --target https://example.com --output text
+python app.py --target https://example.com --output json
+python app.py --target https://example.com --output csv
+python app.py --target https://example.com --output html --output-file report.html
+```
+
+### Custom Plugins
+
+Plugin files can be placed in `plugins/*.py`. Supported hooks:
+
+| Hook | Purpose |
+| --- | --- |
+| `analyze_page(page, body_text)` | Return additional Finding objects or dictionaries. |
+| `finalize_report(report)` | Modify the final report dictionary after scanning. |
 
 ### Configuration Defaults
 

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import argparse
+import csv
 import hashlib
 import html
+import importlib.util
+import io
 import ipaddress
 import json
 import logging
+import os
 import re
 import socket
 import ssl
@@ -19,6 +24,7 @@ from datetime import UTC, datetime
 from html.parser import HTMLParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Final, Iterable, Mapping, Self, TypedDict
 
 from config import DEFAULT_CONFIG
@@ -85,6 +91,8 @@ RISKY_FILES: Final[tuple[str, ...]] = (
     "/actuator/env",
     "/actuator/heapdump",
 )
+GRAPHQL_PATHS: Final[tuple[str, ...]] = ("/graphql", "/api/graphql", "/graphiql", "/playground")
+PLUGIN_DIR: Final[Path] = Path("plugins")
 SSRF_PARAM_NAMES: Final[set[str]] = {
     "url",
     "uri",
@@ -837,6 +845,117 @@ def check_forms(page: PageResult, findings: list[Finding], ssrf_callback: str) -
             )
 
 
+class MLDetector:
+    """Heuristic risk scorer that behaves like a lightweight local ML detector."""
+
+    WEIGHTS: Final[dict[str, int]] = {
+        "secret": 45,
+        "env-secret": 50,
+        "sql-dump": 45,
+        "sql-error": 30,
+        "debug": 20,
+        "password": 20,
+        "directory-listing": 25,
+        "server-error": 15,
+    }
+
+    @classmethod
+    def score_response(cls, response: ResponseAnalysis) -> int:
+        """Return a 0-100 risk score for response fingerprints and keywords."""
+
+        score = 0
+        for keyword in response.keyword_matches:
+            score += cls.WEIGHTS.get(keyword, 0)
+        if response.file_signature in {"dotenv/config file", "SQL dump"}:
+            score += 50
+        if response.soft_404:
+            score += 10
+        if response.body_size > 1_000_000:
+            score += 5
+        return min(score, 100)
+
+    @classmethod
+    def analyze_page(cls, page: PageResult, findings: list[Finding]) -> None:
+        """Add an informational ML-style risk finding for suspicious responses."""
+
+        if not page.response:
+            return
+        score = cls.score_response(page.response)
+        if score < 35:
+            return
+        severity = "high" if score >= 75 else "medium"
+        add_finding(
+            findings,
+            title="Advanced ML-style risk signal",
+            severity=severity,
+            url=page.url,
+            category="ml-detection",
+            detail="A local heuristic model scored this response as suspicious.",
+            evidence=f"risk_score={score}; keywords={', '.join(page.response.keyword_matches) or 'none'}; signature={page.response.file_signature}",
+            remediation="Review the response manually and remove exposed debug, secret, dump, or error content.",
+        )
+
+
+class PluginManager:
+    """Load and execute optional custom scanner plugins from the plugins directory."""
+
+    def __init__(self, plugin_dir: Path = PLUGIN_DIR) -> None:
+        """Create a manager for Python plugin files in plugin_dir."""
+
+        self.plugin_dir = plugin_dir
+        self.plugins: list[Any] = []
+
+    def load(self) -> None:
+        """Import every .py plugin that can be loaded safely enough for local use."""
+
+        if not self.plugin_dir.exists():
+            return
+        for plugin_file in sorted(self.plugin_dir.glob("*.py")):
+            if plugin_file.name.startswith("_"):
+                continue
+            module_name = f"bug_scout_plugin_{plugin_file.stem}"
+            spec = importlib.util.spec_from_file_location(module_name, plugin_file)
+            if not spec or not spec.loader:
+                LOGGER.warning("Skipping plugin without loader: %s", plugin_file)
+                continue
+            module = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(module)
+                self.plugins.append(module)
+                LOGGER.info("Loaded plugin: %s", plugin_file)
+            except Exception as exc:
+                LOGGER.warning("Plugin load failed for %s: %s", plugin_file, exc)
+
+    def analyze_page(self, page: PageResult, body_text: str, findings: list[Finding]) -> None:
+        """Run plugin page hooks that append Finding objects or dictionaries."""
+
+        for plugin in self.plugins:
+            hook = getattr(plugin, "analyze_page", None)
+            if not callable(hook):
+                continue
+            try:
+                plugin_findings = hook(page, body_text) or []
+                for item in plugin_findings:
+                    if isinstance(item, Finding):
+                        findings.append(item)
+                    elif isinstance(item, dict):
+                        findings.append(Finding(**item))
+            except Exception as exc:
+                LOGGER.warning("Plugin analyze_page failed for %s: %s", page.url, exc)
+
+    def finalize_report(self, report: dict[str, Any]) -> None:
+        """Run plugin report hooks after the main report has been built."""
+
+        for plugin in self.plugins:
+            hook = getattr(plugin, "finalize_report", None)
+            if not callable(hook):
+                continue
+            try:
+                hook(report)
+            except Exception as exc:
+                LOGGER.warning("Plugin finalize_report failed: %s", exc)
+
+
 class ContentAnalyzer:
     """Content fingerprinting and response similarity helpers."""
 
@@ -1053,6 +1172,35 @@ def check_risky_files(config: ScanConfig) -> list[PageResult]:
     return results
 
 
+def check_graphql_endpoints(config: ScanConfig, findings: list[Finding]) -> list[PageResult]:
+    """Probe common GraphQL endpoints with safe GET requests."""
+
+    base = config.target.rstrip("/")
+    results: list[PageResult] = []
+    for path in GRAPHQL_PATHS:
+        page, body_text = fetch_analyzed_page(f"{base}{path}", config.timeout)
+        if not page.status or page.status >= 500:
+            continue
+        looks_graphql = (
+            page.status in {HTTPStatus.OK, HTTPStatus.BAD_REQUEST, HTTPStatus.METHOD_NOT_ALLOWED}
+            and re.search(r"\b(graphql|graphiql|playground|query|mutation|schema)\b", body_text, re.IGNORECASE)
+        )
+        if page.status < 404 or looks_graphql:
+            results.append(page)
+        if looks_graphql:
+            add_finding(
+                findings,
+                title="GraphQL endpoint detected",
+                severity="info",
+                url=page.url,
+                category="graphql",
+                detail="A common GraphQL path appears reachable.",
+                evidence=f"status={page.status}; signature={page.response.file_signature if page.response else 'unknown'}",
+                remediation="Disable public GraphQL consoles, restrict introspection where appropriate, and enforce authorization on resolvers.",
+            )
+    return results
+
+
 def check_tls(target: str, timeout: int) -> dict[str, Any]:
     """Collect TLS certificate metadata for HTTPS targets."""
 
@@ -1100,6 +1248,82 @@ def summarize(findings: Iterable[Finding], response_count: int, discovery_count:
     for finding in finding_list:
         summary[finding.severity] = summary.get(finding.severity, 0) + 1
     return summary
+
+
+def findings_to_csv(findings: Iterable[Mapping[str, Any]]) -> str:
+    """Serialize findings to CSV for terminal and browser export."""
+
+    output = io.StringIO()
+    fieldnames = ["severity", "title", "url", "category", "detail", "evidence", "remediation"]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for finding in findings:
+        writer.writerow({key: finding.get(key, "") for key in fieldnames})
+    return output.getvalue()
+
+
+def report_to_html(report: Mapping[str, Any]) -> str:
+    """Render a compact standalone HTML report."""
+
+    findings = report.get("findings", [])
+    rows = "\n".join(
+        "<tr>"
+        f"<td>{html.escape(str(item.get('severity', '')))}</td>"
+        f"<td>{html.escape(str(item.get('title', '')))}</td>"
+        f"<td>{html.escape(str(item.get('url', '')))}</td>"
+        f"<td>{html.escape(str(item.get('detail', '')))}</td>"
+        "</tr>"
+        for item in findings
+        if isinstance(item, Mapping)
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BG Bug Scout Report</title>
+  <style>
+    body {{ font: 14px/1.45 system-ui, sans-serif; color: #18212b; margin: 32px; }}
+    h1 {{ color: #0c7a6f; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #d6dee8; padding: 8px; text-align: left; vertical-align: top; }}
+    th {{ background: #f1f4f7; }}
+  </style>
+</head>
+<body>
+  <h1>BG Bug Scout Report</h1>
+  <p><strong>Target:</strong> {html.escape(str(report.get("target", "")))}</p>
+  <p><strong>Scanned at:</strong> {html.escape(str(report.get("scanned_at", "")))}</p>
+  <h2>Findings</h2>
+  <table>
+    <thead><tr><th>Severity</th><th>Title</th><th>URL</th><th>Detail</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</body>
+</html>
+"""
+
+
+def format_terminal_report(report: Mapping[str, Any]) -> str:
+    """Format a human-readable terminal report."""
+
+    summary = report.get("summary", {})
+    lines = [
+        f"BG Bug Scout report for {report.get('target', '')}",
+        f"Scanned at: {report.get('scanned_at', '')}",
+        f"Duration: {report.get('duration_ms', 0)}ms",
+        (
+            "Summary: "
+            f"critical={summary.get('critical', 0)} high={summary.get('high', 0)} "
+            f"medium={summary.get('medium', 0)} low={summary.get('low', 0)} info={summary.get('info', 0)}"
+        ),
+        "",
+        "Findings:",
+    ]
+    for finding in report.get("findings", []):
+        if isinstance(finding, Mapping):
+            lines.append(f"- [{finding.get('severity', '')}] {finding.get('title', '')} - {finding.get('url', '')}")
+            lines.append(f"  {finding.get('detail', '')}")
+    return "\n".join(lines)
 
 
 def scan_target(
@@ -1155,15 +1379,21 @@ def scan_target(
 
     try:
         pages, body_texts = crawl_target(config)
+        plugin_manager = PluginManager()
+        plugin_manager.load()
         risky_pages = check_risky_files(config)
-        all_response_pages = pages + risky_pages
+        graphql_pages = check_graphql_endpoints(config, findings := [])
+        all_response_pages = pages + risky_pages + graphql_pages
         baseline_path = f"/__bg_bug_scout_missing_{hashlib.sha1(config.target.encode()).hexdigest()[:12]}"
         baseline_page, baseline_text = fetch_analyzed_page(config.target.rstrip("/") + baseline_path, config.timeout)
 
         checker = SecurityChecker(config.ssrf_callback)
+        checker.findings.extend(findings)
         for page in all_response_pages:
             body_text = body_texts.get(page.url, "")
             checker.check_all(page, body_text, baseline_page, baseline_text)
+            MLDetector.analyze_page(page, checker.findings)
+            plugin_manager.analyze_page(page, body_text, checker.findings)
         findings = checker.findings
         compare_content_hashes(all_response_pages + [baseline_page], findings)
 
@@ -1176,19 +1406,35 @@ def scan_target(
         elapsed_ms = int((time.time() - started) * 1000)
         LOGGER.info("Found %s total findings", len(findings))
         LOGGER.info("Completed scan for %s in %sms", config.target, elapsed_ms)
-        return {
+        report = {
             "target": config.target,
             "scanned_at": scanned_at,
             "duration_ms": elapsed_ms,
             "elapsed_ms": elapsed_ms,
-            "summary": summarize(findings, len(all_response_pages), len(risky_pages), len(pages)),
+            "summary": summarize(findings, len(all_response_pages), len(risky_pages) + len(graphql_pages), len(pages)),
             "findings": [asdict(item) for item in findings],
             "pages": [asdict(item) for item in pages],
             "responses": [asdict(item.response) for item in all_response_pages if item.response],
             "ports": [asdict(item) for item in port_results],
             "discovery": [asdict(item) for item in risky_pages],
+            "graphql": [asdict(item) for item in graphql_pages],
             "tls": check_tls(config.target, config.timeout),
+            "plugins": [getattr(plugin, "__name__", "plugin") for plugin in plugin_manager.plugins],
+            "exports": {
+                "findings_csv": findings_to_csv([asdict(item) for item in findings]),
+                "html_report": report_to_html(
+                    {
+                        "target": config.target,
+                        "scanned_at": scanned_at,
+                        "duration_ms": elapsed_ms,
+                        "summary": summarize(findings, len(all_response_pages), len(risky_pages) + len(graphql_pages), len(pages)),
+                        "findings": [asdict(item) for item in findings],
+                    }
+                ),
+            },
         }
+        plugin_manager.finalize_report(report)
+        return report
     except BugScoutError:
         raise
     except Exception as exc:
@@ -1319,6 +1565,7 @@ INDEX_HTML = r"""<!doctype html>
     button { min-height: 42px; border: 0; border-radius: 6px; background: var(--accent); color: white; font: inherit; font-weight: 780; cursor: pointer; }
     button.primary { width: 100%; margin-top: 16px; }
     button.secondary { background: var(--accent-dark); padding: 0 15px; white-space: nowrap; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     button:disabled { opacity: .62; cursor: wait; }
     .notice { margin: 14px 0 0; color: var(--muted); font-size: 13px; }
     .summary { display: grid; grid-template-columns: repeat(6, minmax(82px, 1fr)); gap: 10px; margin-bottom: 14px; }
@@ -1343,7 +1590,7 @@ INDEX_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-  <header><div class="wrap topbar"><div><h1>BG Bug Scout</h1><p class="subtitle">Authorized scanner for web bugs, ports, exposure, and risk signals. Local only.</p></div><button class="secondary" id="downloadBtn" disabled>Download JSON</button></div></header>
+  <header><div class="wrap topbar"><div><h1>BG Bug Scout</h1><p class="subtitle">Authorized scanner for web bugs, ports, GraphQL, backend responses, and risk signals. Local only.</p></div><div class="actions"><button class="secondary" id="downloadBtn" disabled>JSON</button><button class="secondary" id="csvBtn" disabled>CSV</button><button class="secondary" id="htmlBtn" disabled>HTML</button></div></div></header>
   <main class="wrap">
     <section class="panel">
       <label for="target">Authorized target URL</label><input id="target" placeholder="https://example.com" autocomplete="off">
@@ -1357,7 +1604,7 @@ INDEX_HTML = r"""<!doctype html>
     <section><div class="summary" id="summary"></div><div class="tabs"><button class="tab active" data-view="findings">Findings</button><button class="tab" data-view="intel">Intel</button><button class="tab" data-view="responses">Responses</button><button class="tab" data-view="pages">Pages</button><button class="tab" data-view="ports">Ports</button></div><div id="output" class="empty">Scan results will appear here.</div></section>
   </main>
   <script>
-    const scanBtn = document.querySelector("#scanBtn"), downloadBtn = document.querySelector("#downloadBtn"), output = document.querySelector("#output"), summary = document.querySelector("#summary"), tabs = document.querySelectorAll(".tab");
+    const scanBtn = document.querySelector("#scanBtn"), downloadBtn = document.querySelector("#downloadBtn"), csvBtn = document.querySelector("#csvBtn"), htmlBtn = document.querySelector("#htmlBtn"), output = document.querySelector("#output"), summary = document.querySelector("#summary"), tabs = document.querySelectorAll(".tab");
     let latestReport = null, activeView = "findings";
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
     function renderSummary(report) { if (!report) { summary.innerHTML = ""; return; } const items = [["Critical", report.summary.critical], ["High", report.summary.high], ["Medium", report.summary.medium], ["Low", report.summary.low], ["Responses", report.summary.responses || 0], ["Intel", report.summary.discovery || 0]]; summary.innerHTML = items.map(([label, value]) => `<div class="metric"><strong>${value}</strong><span>${label}</span></div>`).join(""); }
@@ -1366,26 +1613,67 @@ INDEX_HTML = r"""<!doctype html>
     function renderPages(report) { if (!report.pages.length) { output.className = "empty"; output.textContent = "No pages crawled."; return; } output.className = ""; output.innerHTML = report.pages.map((page) => card(page.title || "Untitled page", "info", `<div class="url">${escapeHtml(page.url)}</div>${page.error ? `<div class="detail">${escapeHtml(page.error)}</div>` : ""}<div class="detail">${escapeHtml(page.status || "error")} ${escapeHtml(page.content_type || "unknown content type")}</div><div class="detail">${page.links.length} link(s), ${page.forms.length} form(s), ${page.scripts.length} script(s)</div>`, "page")).join(""); }
     function renderPorts(report) { if (!report.ports.length) { output.className = "empty"; output.textContent = "No open ports found in the selected scan set."; return; } output.className = ""; output.innerHTML = report.ports.map((port) => card(`Port ${port.port}`, "info", `<div class="detail">${escapeHtml(port.service_hint)}</div>${port.banner ? `<div class="evidence">${escapeHtml(port.banner)}</div>` : ""}`, "port")).join(""); }
     function renderIntel(report) { const tls = report.tls || {}, discoveries = report.discovery || []; output.className = ""; output.innerHTML = card("TLS Certificate", tls.error ? "medium" : "info", `<div class="detail"><strong>Host:</strong> ${escapeHtml(tls.host || report.target)}</div>${tls.reason ? `<div class="detail">${escapeHtml(tls.reason)}</div>` : ""}${tls.error ? `<div class="evidence">${escapeHtml(tls.error)}</div>` : ""}${tls.not_after ? `<div class="detail"><strong>Expires:</strong> ${escapeHtml(tls.not_after)}</div>` : ""}`) + discoveries.map((item) => card(`${item.url}`, item.status && item.status < 404 ? "info" : "low", `<div class="detail">${escapeHtml(item.status || "error")} ${escapeHtml(item.content_type || "")}</div>`)).join(""); }
-    function renderResponses(report) { const responses = report.responses || []; if (!responses.length) { output.className = "empty"; output.textContent = "No response fingerprints captured."; return; } output.className = ""; output.innerHTML = responses.map((response) => { const keywords = response.keyword_matches && response.keyword_matches.length ? response.keyword_matches.map((item) => `<span class="pill">${escapeHtml(item)}</span>`).join("") : `<span class="pill">no keyword match</span>`; return card(response.url, response.soft_404 ? "low" : "info", `<div class="detail"><strong>Content-Type:</strong> ${escapeHtml(response.content_type || "missing")}</div><div class="detail"><strong>File signature:</strong> ${escapeHtml(response.file_signature || "unknown")}</div><div class="detail"><strong>Body size:</strong> ${escapeHtml(response.body_size)} bytes</div><div class="evidence">sha256:${escapeHtml(response.content_hash || "empty")}</div><div class="pillrow">${keywords}</div>${response.soft_404 ? `<div class="detail"><strong>Soft 404:</strong> ${escapeHtml(response.soft_404_reason)}</div>` : ""}<div class="evidence body-preview">${escapeHtml(response.response_body || "")}${response.response_body_truncated ? "\n...[truncated]" : ""}</div>`); }).join(""); }
+    function renderResponses(report) { const responses = report.responses || []; if (!responses.length) { output.className = "empty"; output.textContent = "No backend server responses captured."; return; } output.className = ""; output.innerHTML = responses.map((response) => { const keywords = response.keyword_matches && response.keyword_matches.length ? response.keyword_matches.map((item) => `<span class="pill">${escapeHtml(item)}</span>`).join("") : `<span class="pill">no keyword match</span>`; return card(response.url, response.soft_404 ? "low" : "info", `<div class="detail"><strong>Status:</strong> ${escapeHtml(response.status || "error")}</div><div class="detail"><strong>Content-Type:</strong> ${escapeHtml(response.content_type || "missing")}</div><div class="detail"><strong>File signature:</strong> ${escapeHtml(response.file_signature || "unknown")}</div><div class="detail"><strong>Body size:</strong> ${escapeHtml(response.body_size)} bytes</div><div class="evidence">sha256:${escapeHtml(response.content_hash || "empty")}</div><div class="pillrow">${keywords}</div>${response.soft_404 ? `<div class="detail"><strong>Soft 404:</strong> ${escapeHtml(response.soft_404_reason)}</div>` : ""}<div class="detail"><strong>Decoded backend response:</strong></div><div class="evidence body-preview">${escapeHtml(response.response_body || "")}${response.response_body_truncated ? "\n...[truncated]" : ""}</div>`); }).join(""); }
     function renderReport() { renderSummary(latestReport); if (!latestReport) return; if (activeView === "pages") renderPages(latestReport); else if (activeView === "ports") renderPorts(latestReport); else if (activeView === "responses") renderResponses(latestReport); else if (activeView === "intel") renderIntel(latestReport); else renderFindings(latestReport); }
     tabs.forEach((tab) => tab.addEventListener("click", () => { tabs.forEach((item) => item.classList.remove("active")); tab.classList.add("active"); activeView = tab.dataset.view; renderReport(); }));
-    scanBtn.addEventListener("click", async () => { const body = { target: document.querySelector("#target").value.trim(), max_pages: Number(document.querySelector("#maxPages").value), timeout: Number(document.querySelector("#timeout").value), scan_ports: document.querySelector("#scanPorts").checked, ports: document.querySelector("#ports").value.trim(), ssrf_callback: document.querySelector("#ssrf").value.trim() }; scanBtn.disabled = true; downloadBtn.disabled = true; output.className = "empty"; output.textContent = "Scanning with safe probes..."; try { const response = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || "Scan failed"); latestReport = data; downloadBtn.disabled = false; renderReport(); } catch (error) { latestReport = null; renderSummary(null); output.className = "empty"; output.textContent = error.message; } finally { scanBtn.disabled = false; } });
+    scanBtn.addEventListener("click", async () => { const body = { target: document.querySelector("#target").value.trim(), max_pages: Number(document.querySelector("#maxPages").value), timeout: Number(document.querySelector("#timeout").value), scan_ports: document.querySelector("#scanPorts").checked, ports: document.querySelector("#ports").value.trim(), ssrf_callback: document.querySelector("#ssrf").value.trim() }; scanBtn.disabled = true; downloadBtn.disabled = true; csvBtn.disabled = true; htmlBtn.disabled = true; output.className = "empty"; output.textContent = "Scanning with safe probes..."; try { const response = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || "Scan failed"); latestReport = data; downloadBtn.disabled = false; csvBtn.disabled = false; htmlBtn.disabled = false; renderReport(); } catch (error) { latestReport = null; renderSummary(null); output.className = "empty"; output.textContent = error.message; } finally { scanBtn.disabled = false; } });
     downloadBtn.addEventListener("click", () => { if (!latestReport) return; const blob = new Blob([JSON.stringify(latestReport, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = `bug-scout-${new Date().toISOString().slice(0, 10)}.json`; link.click(); URL.revokeObjectURL(url); });
+    csvBtn.addEventListener("click", () => { if (!latestReport) return; const blob = new Blob([latestReport.exports?.findings_csv || ""], { type: "text/csv" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = `bug-scout-${new Date().toISOString().slice(0, 10)}.csv`; link.click(); URL.revokeObjectURL(url); });
+    htmlBtn.addEventListener("click", () => { if (!latestReport) return; const blob = new Blob([latestReport.exports?.html_report || ""], { type: "text/html" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = `bug-scout-${new Date().toISOString().slice(0, 10)}.html`; link.click(); URL.revokeObjectURL(url); });
   </script>
 </body>
 </html>
 """
 
 
-def main() -> None:
-    """Start the local scanner web server."""
+def run_terminal_scan(args: argparse.Namespace) -> int:
+    """Run one scan from the terminal and print the selected output format."""
 
+    configure_logging(args.log_level)
+    report = scan_target(args.target, args.max_pages, args.timeout, args.scan_ports, args.ports, args.ssrf_callback)
+    if args.output == "json":
+        print(json.dumps(report, indent=2))
+    elif args.output == "csv":
+        print(report["exports"]["findings_csv"])
+    elif args.output == "html":
+        output_path = Path(args.output_file)
+        output_path.write_text(report["exports"]["html_report"], encoding="utf-8")
+        print(f"Wrote HTML report to {output_path}")
+    else:
+        print(format_terminal_report(report))
+    return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build command-line arguments for server and terminal scan modes."""
+
+    parser = argparse.ArgumentParser(description="BG Bug Scout local scanner")
+    parser.add_argument("--target", help="Run a terminal-only scan against this authorized target")
+    parser.add_argument("--max-pages", type=int, default=8, help="Maximum pages to crawl for terminal scans")
+    parser.add_argument("--timeout", type=int, default=8, help="Request timeout in seconds")
+    parser.add_argument("--scan-ports", action="store_true", help="Enable port scanning in terminal mode")
+    parser.add_argument("--ports", default="", help="Ports such as common, 80,443, or 8000-8010")
+    parser.add_argument("--ssrf-callback", default="", help="Optional SSRF callback URL for evidence notes")
+    parser.add_argument("--output", choices=["text", "json", "csv", "html"], default="text", help="Terminal output format")
+    parser.add_argument("--output-file", default="bug-scout-report.html", help="Path for --output html")
+    parser.add_argument("--log-level", default=DEFAULT_CONFIG.log_level, help="Logging level")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Start the local scanner web server or run a terminal-only scan."""
+
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.target:
+        return run_terminal_scan(args)
     configure_logging()
     server = ThreadingHTTPServer((HOST, PORT), ScoutHandler)
     LOGGER.info("BG Bug Scout running at http://%s:%s", HOST, PORT)
     LOGGER.info("Use only on systems you own or have explicit permission to test.")
     server.serve_forever()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
