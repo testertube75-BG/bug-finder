@@ -1186,6 +1186,31 @@ class ScoutHandler(BaseHTTPRequestHandler):
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
+    def do_OPTIONS(self) -> None:
+        """Return supported methods for API clients."""
+
+        if self.path == "/api/scan":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Allow", "OPTIONS, POST")
+            self.send_header("Access-Control-Allow-Methods", "OPTIONS, POST")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Allow", "GET, OPTIONS")
+        self.end_headers()
+
+    def do_DELETE(self) -> None:
+        """Reject DELETE requests because the server does not persist reports."""
+
+        data = json.dumps({"error": "DELETE is not supported; scan reports are not stored server-side."}, indent=2).encode("utf-8")
+        self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+        self.send_header("Allow", "GET, OPTIONS, POST")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_POST(self) -> None:
         """Handle scan requests from the browser UI."""
 

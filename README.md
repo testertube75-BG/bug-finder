@@ -94,16 +94,30 @@ OK
 
 Edit [config.py](config.py) to change runtime defaults.
 
-| Setting | Default | Purpose |
+| Setting | Current Default | Limit / Options | Purpose |
+| --- | --- | --- | --- |
+| `host` | `127.0.0.1` | Any local bind address | Local bind address |
+| `port` | `8765` | Any free local TCP port | Local app port |
+| `max_body_bytes` | `600000` | Bounded by default; do not set unlimited for untrusted targets | Maximum response body read size |
+| `max_pages_limit` | `30` | Bounded by default; higher values increase crawl time | Maximum crawl page cap |
+| `max_workers` | `5` | Bounded by default; higher values increase concurrency | Worker count for concurrent checks |
+| `request_timeout` | `8` | API clamps request values to 2-20 seconds | Default request timeout |
+| `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | Logging level |
+| `log_file` | `bug-scout.log` | Optional file path | Optional log file path |
+
+> [!NOTE]
+> Unlimited response size, crawl pages, or workers can make a scan slow or unstable. The app keeps bounded defaults for safety and predictable local performance.
+
+## HTTP Methods
+
+| Method | Path | Result |
 | --- | --- | --- |
-| `host` | `127.0.0.1` | Local bind address |
-| `port` | `8765` | Local app port |
-| `max_body_bytes` | `600000` | Maximum response body read size |
-| `max_pages_limit` | `30` | Maximum crawl page cap |
-| `max_workers` | `5` | Bounded worker count |
-| `request_timeout` | `8` | Default request timeout |
-| `log_level` | `INFO` | Logging level |
-| `log_file` | `bug-scout.log` | Optional log file path |
+| `GET` | `/` or `/index.html` | Opens the scanner UI |
+| `POST` | `/api/scan` | Runs a scan and returns JSON |
+| `OPTIONS` | `/api/scan` | May be used by clients to inspect allowed API methods |
+| `DELETE` | Any path | Not supported; no scan data is stored server-side |
+
+See [API.md](API.md) for all request and response fields.
 
 ## Troubleshooting
 

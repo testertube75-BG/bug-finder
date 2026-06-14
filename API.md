@@ -1,5 +1,15 @@
 # API Documentation
 
+## HTTP Methods
+
+| Method | Path | Status | Description |
+| --- | --- | --- | --- |
+| `GET` | `/` | `200 OK` | Serves the local scanner UI. |
+| `GET` | `/index.html` | `200 OK` | Serves the local scanner UI. |
+| `POST` | `/api/scan` | `200 OK` | Runs a scan and returns a JSON report. |
+| `OPTIONS` | `/api/scan` | `204 No Content` | Returns allowed methods for API clients. |
+| `DELETE` | Any path | `405 Method Not Allowed` | Not supported because reports are not stored server-side. |
+
 ## POST /api/scan
 
 Scans an authorized web target and returns a JSON security report.
@@ -54,6 +64,35 @@ Scans an authorized web target and returns a JSON security report.
   }
 }
 ```
+
+### Response Fields
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `target` | string | Normalized target URL. |
+| `scanned_at` | string | ISO 8601 timestamp when the scan started. |
+| `duration_ms` | number | Scan duration in milliseconds. |
+| `elapsed_ms` | number | Backward-compatible alias for `duration_ms`. |
+| `summary` | object | Count of pages, responses, findings, discovery items, and severity totals. |
+| `findings` | array | Security findings with `title`, `severity`, `url`, `category`, `detail`, `evidence`, and `remediation`. |
+| `pages` | array | Crawled page objects with URL, status, content type, title, links, forms, scripts, headers, and response analysis. |
+| `responses` | array | Response fingerprints including body preview, hash, file signature, keyword matches, and soft-404 metadata. |
+| `ports` | array | Open TCP ports with port number, service hint, and optional banner. |
+| `discovery` | array | Risky-file discovery responses that were reachable. |
+| `tls` | object | TLS certificate metadata or TLS error details. |
+
+### Configuration Defaults
+
+| Setting | Current Default | Limit / Options | Purpose |
+| --- | --- | --- | --- |
+| `host` | `127.0.0.1` | Any local bind address | Local bind address |
+| `port` | `8765` | Any free local TCP port | Local app port |
+| `max_body_bytes` | `600000` | Bounded by default; unlimited is not recommended | Maximum response body read size |
+| `max_pages_limit` | `30` | Bounded by default; unlimited is not recommended | Maximum crawl page cap |
+| `max_workers` | `5` | Bounded by default; unlimited is not recommended | Worker count for concurrent checks |
+| `request_timeout` | `8` | API clamps request values to 2-20 seconds | Default request timeout |
+| `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | Logging level |
+| `log_file` | `bug-scout.log` | Optional file path | Optional log file path |
 
 ### Errors
 
