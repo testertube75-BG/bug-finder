@@ -386,8 +386,8 @@ def configure_logging(level: int | str = DEFAULT_CONFIG.log_level) -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     try:
         handlers.insert(0, logging.FileHandler(DEFAULT_CONFIG.log_file, encoding="utf-8"))
-    except OSError as exc:
-        LOGGER.warning("File logging disabled: %s", exc)
+    except OSError:
+        pass
     logging.basicConfig(
         level=resolved_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -2019,7 +2019,7 @@ INDEX_HTML = r"""<!doctype html>
 def run_terminal_scan(args: argparse.Namespace) -> int:
     """Run one scan from the terminal and print the selected output format."""
 
-    configure_logging(args.log_level)
+    configure_logging(args.log_level or logging.ERROR)
     report = scan_target(args.target, args.max_pages, args.timeout, args.scan_ports, args.ports, args.ssrf_callback)
     if args.output == "json":
         print(json.dumps(report, indent=2))
@@ -2037,7 +2037,7 @@ def run_terminal_scan(args: argparse.Namespace) -> int:
 def run_update_command(apply: bool) -> int:
     """Check for or apply GitHub updates from terminal mode."""
 
-    configure_logging()
+    configure_logging(logging.ERROR)
     result = apply_updates() if apply else check_for_updates()
     print(json.dumps(result, indent=2))
     if apply and result.get("updated"):
@@ -2057,7 +2057,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ssrf-callback", default="", help="Optional SSRF callback URL for evidence notes")
     parser.add_argument("--output", choices=["text", "json", "csv", "html"], default="text", help="Terminal output format")
     parser.add_argument("--output-file", default="bug-scout-report.html", help="Path for --output html")
-    parser.add_argument("--log-level", default=DEFAULT_CONFIG.log_level, help="Logging level")
+    parser.add_argument("--log-level", default=None, help="Logging level for terminal mode; default keeps scan output clean")
     parser.add_argument("--update", action="store_true", help="Check GitHub main for app file updates")
     parser.add_argument("--apply-update", action="store_true", help="Download and replace changed files from GitHub main")
     return parser
