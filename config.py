@@ -11,8 +11,8 @@ class AppConfig:
     port: int = 8765
     max_body_bytes: int = 600_000
     max_pages_limit: int = 30
+    max_workers: int = 5
     request_timeout: int = 8
-    max_workers: int = 16
     log_level: str = "INFO"
     log_file: str = "bug-scout.log"
 

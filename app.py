@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Final, Iterable, Mapping, Self, TypedDict
 
 from config import DEFAULT_CONFIG
+from rate_limiter import RateLimiter
 
 
 HOST: Final[str] = DEFAULT_CONFIG.host
@@ -1155,6 +1156,7 @@ class ScoutHandler(BaseHTTPRequestHandler):
     """HTTP handler for the local BG Bug Scout interface and scan API."""
 
     server_version = "BGBugScout/0.2"
+    rate_limiter = RateLimiter(max_requests=20, window=60)
 
     def log_message(self, format: str, *args: object) -> None:
         """Route built-in request logs through the application logger."""
@@ -1189,6 +1191,10 @@ class ScoutHandler(BaseHTTPRequestHandler):
 
         if self.path != "/api/scan":
             self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        client_ip = self.client_address[0]
+        if not self.rate_limiter.is_allowed(client_ip):
+            self.send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "Too many requests. Please try again later."})
             return
         try:
             length = int(self.headers.get("content-length", "0"))
