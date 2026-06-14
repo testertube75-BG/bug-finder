@@ -109,6 +109,10 @@ GRAPHQL_PATHS: Final[tuple[str, ...]] = ("/graphql", "/api/graphql", "/graphiql"
 PLUGIN_DIR: Final[Path] = Path("plugins")
 XSS_TEST_PAYLOAD: Final[str] = "<svg/onload=alert('bg-xss')>"
 XSS_CANARY: Final[str] = "bg-xss"
+CSRF_TEST_PAYLOAD: Final[str] = "missing-csrf-token-check"
+SSRF_TEST_PAYLOAD: Final[str] = "https://example-callback.invalid/bg-ssrf"
+GRAPHQL_TEST_PAYLOAD: Final[str] = "{ __typename }"
+HEADER_TEST_PAYLOAD: Final[str] = "https://evil.example"
 CSRF_TOKEN_NAMES: Final[set[str]] = {"csrf", "csrf_token", "_csrf", "authenticity_token", "xsrf", "xsrf_token", "_token"}
 DANGEROUS_JS_SINKS: Final[dict[str, str]] = {
     "innerHTML": r"\.innerHTML\s*=",
@@ -2027,7 +2031,8 @@ def run_terminal_scan(args: argparse.Namespace) -> int:
     """Run one scan from the terminal and print the selected output format."""
 
     configure_logging(args.log_level or logging.ERROR)
-    report = scan_target(args.target, args.max_pages, args.timeout, args.scan_ports, args.ports, args.ssrf_callback, args.xss_payload)
+    selected_payload = args.payload or args.xss_payload
+    report = scan_target(args.target, args.max_pages, args.timeout, args.scan_ports, args.ports, args.ssrf_callback or args.ssrf_payload, selected_payload)
     if args.output == "json":
         print(json.dumps(report, indent=2))
     elif args.output == "csv":
@@ -2049,6 +2054,16 @@ SCAN_TYPE_OPTIONS: Final[dict[str, tuple[str, set[str]]]] = {
     "e": ("GraphQL", {"graphql"}),
     "f": ("Nmap-style port scan", {"ports"}),
     "g": ("Full scan", set()),
+}
+
+SCAN_TYPE_PAYLOADS: Final[dict[str, tuple[str, str]]] = {
+    "a": ("XSS payload", XSS_TEST_PAYLOAD),
+    "b": ("CSRF marker payload", CSRF_TEST_PAYLOAD),
+    "c": ("SSRF callback/payload URL", SSRF_TEST_PAYLOAD),
+    "d": ("Header/CORS Origin payload", HEADER_TEST_PAYLOAD),
+    "e": ("GraphQL query payload", GRAPHQL_TEST_PAYLOAD),
+    "f": ("Banner probe payload", ""),
+    "g": ("Generic payload", XSS_TEST_PAYLOAD),
 }
 
 
@@ -2096,8 +2111,9 @@ def run_interactive_scan() -> None:
     timeout = int(prompt_choice("Timeout seconds [8]: ", "8"))
     default_ports = "common" if scan_type == "f" else ""
     ports = prompt_choice("Optional ports, e.g. 80,443,8000-8010 [empty]: ", default_ports)
-    payload = prompt_choice(f"XSS payload [{XSS_TEST_PAYLOAD}]: ", XSS_TEST_PAYLOAD)
-    ssrf_callback = prompt_choice("SSRF callback URL [empty]: ", "")
+    payload_label, default_payload = SCAN_TYPE_PAYLOADS.get(scan_type, SCAN_TYPE_PAYLOADS["g"])
+    payload = prompt_choice(f"{payload_label} [{default_payload or 'empty'}]: ", default_payload)
+    ssrf_callback = prompt_choice("SSRF callback URL [empty]: ", payload if scan_type == "c" else "")
     scan_ports_enabled = scan_type == "f" or bool(ports)
     report = scan_target(target, max_pages, timeout, scan_ports_enabled, ports, ssrf_callback, payload)
     print(format_terminal_report(filter_report_for_scan_type(report, scan_type)))
@@ -2160,8 +2176,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=int, default=8, help="Request timeout in seconds")
     parser.add_argument("--scan-ports", action="store_true", help="Enable port scanning in terminal mode")
     parser.add_argument("--ports", default="", help="Ports such as common, 80,443, or 8000-8010")
+    payload_group = parser.add_argument_group("payload options")
     parser.add_argument("--ssrf-callback", default="", help="Optional SSRF callback URL for evidence notes")
-    parser.add_argument("--xss-payload", default=XSS_TEST_PAYLOAD, help="Reflected-XSS probe payload for authorized scans")
+    payload_group.add_argument("--payload", default="", help="Generic payload override used by the selected scanner")
+    payload_group.add_argument("--xss-payload", default=XSS_TEST_PAYLOAD, help=f"Reflected-XSS probe payload (default: {XSS_TEST_PAYLOAD})")
+    payload_group.add_argument("--csrf-payload", default=CSRF_TEST_PAYLOAD, help=f"CSRF marker payload for PoC notes (default: {CSRF_TEST_PAYLOAD})")
+    payload_group.add_argument("--ssrf-payload", default=SSRF_TEST_PAYLOAD, help=f"SSRF callback/payload URL (default: {SSRF_TEST_PAYLOAD})")
+    payload_group.add_argument("--graphql-payload", default=GRAPHQL_TEST_PAYLOAD, help=f"GraphQL query payload (default: {GRAPHQL_TEST_PAYLOAD})")
+    payload_group.add_argument("--header-payload", default=HEADER_TEST_PAYLOAD, help=f"Header/CORS Origin payload (default: {HEADER_TEST_PAYLOAD})")
     parser.add_argument("--output", choices=["text", "json", "csv", "html"], default="text", help="Terminal output format")
     parser.add_argument("--output-file", default="bug-scout-report.html", help="Path for --output html")
     parser.add_argument("--log-level", default=None, help="Logging level for terminal mode; default keeps scan output clean")

@@ -121,10 +121,31 @@ class TestScanConfig(unittest.TestCase):
     def test_cli_parser_accepts_terminal_mode(self) -> None:
         """CLI parser supports terminal-only scan arguments."""
 
-        args = build_arg_parser().parse_args(["--target", "example.com", "--output", "json", "--xss-payload", "test"])
+        args = build_arg_parser().parse_args(["--target", "example.com", "--output", "json", "--xss-payload", "test", "--payload", "generic"])
         self.assertEqual(args.target, "example.com")
         self.assertEqual(args.output, "json")
         self.assertEqual(args.xss_payload, "test")
+        self.assertEqual(args.payload, "generic")
+
+    def test_cli_parser_accepts_all_payload_options(self) -> None:
+        """CLI parser exposes payload options for every scanner family."""
+
+        args = build_arg_parser().parse_args(
+            [
+                "--csrf-payload",
+                "csrf",
+                "--ssrf-payload",
+                "https://callback.example",
+                "--graphql-payload",
+                "{__typename}",
+                "--header-payload",
+                "https://origin.example",
+            ]
+        )
+        self.assertEqual(args.csrf_payload, "csrf")
+        self.assertEqual(args.ssrf_payload, "https://callback.example")
+        self.assertEqual(args.graphql_payload, "{__typename}")
+        self.assertEqual(args.header_payload, "https://origin.example")
 
     def test_cli_parser_accepts_serve_mode(self) -> None:
         """CLI parser supports direct web-server mode."""

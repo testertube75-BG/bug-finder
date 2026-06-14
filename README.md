@@ -162,6 +162,24 @@ Custom XSS payload:
 python app.py --target https://example.com/search?q=test --output text --xss-payload "<svg/onload=alert(1)>"
 ```
 
+See every scanner payload option:
+
+```bash
+python app.py -h
+python app.py --help
+```
+
+Payload options include:
+
+```text
+--payload            Generic payload override
+--xss-payload        Reflected-XSS probe payload
+--csrf-payload       CSRF marker payload for PoC notes
+--ssrf-payload       SSRF callback/payload URL
+--graphql-payload    GraphQL query payload
+--header-payload     Header/CORS Origin payload
+```
+
 Export formats:
 
 ```bash
