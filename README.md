@@ -40,7 +40,7 @@
 | **Response Analysis** | Decoded backend response body, Content-Type validation, file signatures, keywords, duplicate hashes |
 | **Advanced Detection** | Local ML-style heuristic scoring and plugin-powered custom findings |
 | **Reports** | JSON, CSV, and standalone HTML exports |
-| **Port Scan** | Configurable `ThreadPoolExecutor` scanning with custom ports and ranges |
+| **Port Scan** | Nmap-style TCP connect details: state, reason, service hint, banner, version guess, and latency |
 | **Safety** | Private-network target blocking and local request rate limiting |
 | **Quality** | Type hints, custom exceptions, logging, unit tests, and CI workflow |
 
@@ -75,11 +75,22 @@ http://127.0.0.1:8765/
 
 ### 5. Scan
 
-1. Enter an authorized target, for example `https://example.com`.
-2. Set max pages, timeout, and optional ports.
+1. Enter an authorized target URL or IP, for example `https://example.com` or `203.0.113.5`.
+2. Set max pages, timeout, and optional ports or ranges.
 3. Click **Run safe scan**.
 4. Review **Findings**, **Intel**, **Responses**, **Pages**, and **Ports**.
 5. Export as **JSON**, **CSV**, or **HTML**.
+
+Port scan results show nmap-style details for each scanned TCP port:
+
+```text
+host:port/tcp
+state: open | closed | filtered
+reason: tcp-connect | connection-refused | timeout
+service: HTTP, SSH, MySQL, Redis, unknown, ...
+latency: milliseconds
+banner/version: captured when the service exposes one
+```
 
 ## API Usage
 
@@ -195,7 +206,7 @@ Edit [config.py](config.py) to change runtime defaults.
 | --- | --- |
 | Port already in use | Change `port` in `config.py`, then run `python app.py` again. |
 | Browser cannot open app | Confirm the server is running and open `http://127.0.0.1:8765/`. |
-| Scan rejected | Private, loopback, link-local, and multicast targets are blocked by design. |
+| Scan rejected | Private, loopback, link-local, and multicast targets are blocked by design. Public IP targets and domain URLs are accepted. |
 | Too many requests | Wait for the rate-limit window to reset, then retry. |
 | Update applied but code looks old | Restart the app so Python reloads changed files. |
 

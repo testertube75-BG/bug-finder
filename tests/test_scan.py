@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app import Finding, MLDetector, ResponseAnalysis, build_arg_parser, build_update_plan, findings_to_csv, normalize_url, parse_ports, report_to_html, ScanConfig, TargetError
+from app import Finding, MLDetector, ResponseAnalysis, build_arg_parser, build_update_plan, findings_to_csv, infer_service_version, normalize_url, parse_ports, report_to_html, service_hint, ScanConfig, TargetError
 from rate_limiter import RateLimiter
 
 
@@ -14,6 +14,11 @@ class TestScanConfig(unittest.TestCase):
 
         result = normalize_url("example.com")
         self.assertTrue(result.startswith("https://"))
+
+    def test_normalize_url_accepts_ip_target(self) -> None:
+        """IP addresses are valid scan targets."""
+
+        self.assertEqual(normalize_url("203.0.113.5"), "https://203.0.113.5")
 
     def test_invalid_url_raises_error(self) -> None:
         """URLs with spaces raise the custom target error."""
@@ -34,6 +39,18 @@ class TestScanConfig(unittest.TestCase):
         result = parse_ports("8000-8010")
         self.assertEqual(len(result), 11)
         self.assertIn(8005, result)
+
+    def test_nmap_style_service_hints(self) -> None:
+        """Common ports return nmap-style service hints."""
+
+        self.assertEqual(service_hint(22), "SSH")
+        self.assertEqual(service_hint(9200), "Elasticsearch")
+
+    def test_infer_service_version_from_http_banner(self) -> None:
+        """HTTP server banners produce a version guess."""
+
+        banner = "HTTP/1.1 200 OK\r\nServer: nginx/1.25\r\n"
+        self.assertEqual(infer_service_version(80, banner), "nginx/1.25")
 
     def test_scan_config_from_values(self) -> None:
         """ScanConfig.from_values normalizes target and preserves bounded values."""

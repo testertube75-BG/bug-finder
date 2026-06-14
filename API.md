@@ -34,7 +34,7 @@ Scans an authorized web target and returns a JSON security report.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `target` | string | Authorized target URL. Missing schemes default to `https://`. |
+| `target` | string | Authorized target URL or public IP address. Missing schemes default to `https://`. |
 | `max_pages` | number | Maximum same-origin pages to crawl. Unlimited app config means the request value is not capped by a global page limit. |
 | `timeout` | number | Per-request timeout in seconds. Values are clamped to 2-20. |
 | `scan_ports` | boolean | Enables bounded TCP port scanning. |
@@ -72,7 +72,7 @@ Scans an authorized web target and returns a JSON security report.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `target` | string | Normalized target URL. |
+| `target` | string | Normalized target URL or IP-based URL. |
 | `scanned_at` | string | ISO 8601 timestamp when the scan started. |
 | `duration_ms` | number | Scan duration in milliseconds. |
 | `elapsed_ms` | number | Backward-compatible alias for `duration_ms`. |
@@ -80,7 +80,7 @@ Scans an authorized web target and returns a JSON security report.
 | `findings` | array | Security findings with `title`, `severity`, `url`, `category`, `detail`, `evidence`, and `remediation`. |
 | `pages` | array | Crawled page objects with URL, status, content type, title, links, forms, scripts, headers, and response analysis. |
 | `responses` | array | Response fingerprints including decoded response body, hash, file signature, keyword matches, and soft-404 metadata. |
-| `ports` | array | Open TCP ports with port number, service hint, and optional banner. |
+| `ports` | array | Nmap-style TCP port results including host, port, protocol, state, reason, latency, service hint, version guess, and optional banner. |
 | `discovery` | array | Risky-file discovery responses that were reachable. |
 | `graphql` | array | Common GraphQL endpoint probes that looked reachable or GraphQL-like. |
 | `tls` | object | TLS certificate metadata or TLS error details. |

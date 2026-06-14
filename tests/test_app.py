@@ -11,6 +11,9 @@ class UrlValidationTests(unittest.TestCase):
     def test_normalize_url_adds_https_and_removes_fragment(self) -> None:
         self.assertEqual(app.normalize_url("example.com/path#section"), "https://example.com/path")
 
+    def test_normalize_url_accepts_ip_address(self) -> None:
+        self.assertEqual(app.normalize_url("192.0.2.10:8080/path"), "https://192.0.2.10:8080/path")
+
     def test_normalize_url_rejects_empty_value(self) -> None:
         with self.assertRaises(ValueError):
             app.normalize_url(" ")

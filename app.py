@@ -238,12 +238,19 @@ class PageResult:
 
 @dataclass(slots=True)
 class PortResult:
-    """Result for one TCP port probe."""
+    """Nmap-style result for one TCP port probe."""
 
+    host: str
     port: int
     open: bool
+    protocol: str = "tcp"
+    state: str = "closed"
+    reason: str = ""
+    latency_ms: int = 0
     banner: str = ""
     service_hint: str = ""
+    service_version: str = ""
+    scanned_at: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,7 +383,7 @@ def configure_logging(level: int | str = DEFAULT_CONFIG.log_level) -> None:
 
 
 def normalize_url(raw_url: str) -> str:
-    """Normalize and validate an HTTP or HTTPS target URL."""
+    """Normalize and validate an HTTP or HTTPS target URL or IP address."""
 
     try:
         url = raw_url.strip()
@@ -387,8 +394,13 @@ def normalize_url(raw_url: str) -> str:
         if not re.match(r"^https?://", url, re.IGNORECASE):
             url = f"https://{url}"
         parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname or "." not in parsed.hostname:
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
             raise TargetError(f"Invalid URL format: {raw_url}")
+        try:
+            ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            if "." not in parsed.hostname:
+                raise TargetError(f"Invalid URL or IP format: {raw_url}") from None
         return urllib.parse.urlunparse(parsed._replace(fragment=""))
     except TargetError:
         raise
@@ -1052,34 +1064,109 @@ def service_hint(port: int) -> str:
         22: "SSH",
         25: "SMTP",
         53: "DNS",
+        69: "TFTP",
         80: "HTTP",
+        110: "POP3",
+        123: "NTP",
+        135: "MS RPC",
+        139: "NetBIOS",
+        143: "IMAP",
         443: "HTTPS",
+        445: "SMB",
+        465: "SMTPS",
+        587: "SMTP submission",
+        993: "IMAPS",
+        995: "POP3S",
+        1433: "MSSQL",
+        1521: "Oracle",
+        2049: "NFS",
+        2375: "Docker API",
+        3000: "HTTP dev",
         3306: "MySQL",
         3389: "RDP",
+        5000: "HTTP/API",
         5432: "PostgreSQL",
+        5601: "Kibana",
+        5900: "VNC",
         6379: "Redis",
+        8000: "HTTP alternate",
         8080: "HTTP alternate",
+        8443: "HTTPS alternate",
+        9000: "HTTP/API",
         9200: "Elasticsearch",
+        9300: "Elasticsearch transport",
+        11211: "Memcached",
         27017: "MongoDB",
     }
     return hints.get(port, "unknown")
 
 
-def scan_port(hostname: str, port: int, timeout: int) -> PortResult:
-    """Probe one TCP port and capture a small banner when available."""
+def infer_service_version(port: int, banner: str) -> str:
+    """Infer a lightweight service version string from a banner when available."""
+
+    if not banner:
+        return ""
+    first_line = banner.splitlines()[0].strip()
+    if port in {80, 8000, 8080, 8443, 9000} and "server:" in banner.lower():
+        match = re.search(r"(?im)^server:\s*(.+)$", banner)
+        if match:
+            return match.group(1).strip()
+    return first_line[:120]
+
+
+def probe_http_banner(hostname: str, port: int, timeout: int) -> str:
+    """Send a minimal HTTP HEAD request to improve web service detection."""
 
     try:
         with socket.create_connection((hostname, port), timeout=timeout) as sock:
             sock.settimeout(1.0)
+            request = f"HEAD / HTTP/1.0\r\nHost: {hostname}\r\nUser-Agent: {USER_AGENT}\r\n\r\n".encode("ascii")
+            sock.sendall(request)
+            return sock.recv(512).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def scan_port(hostname: str, port: int, timeout: int) -> PortResult:
+    """Probe one TCP port and capture nmap-style state, reason, latency, and banner."""
+
+    started = time.perf_counter()
+    scanned_at = datetime.now(UTC).isoformat()
+    hint = service_hint(port)
+    try:
+        with socket.create_connection((hostname, port), timeout=timeout) as sock:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            sock.settimeout(1.0)
             try:
-                banner = sock.recv(120).decode("utf-8", errors="replace").strip()
+                banner = sock.recv(256).decode("utf-8", errors="replace").strip()
             except TimeoutError:
                 banner = ""
             except OSError:
                 banner = ""
-            return PortResult(port=port, open=True, banner=banner, service_hint=service_hint(port))
-    except (ConnectionRefusedError, TimeoutError, OSError):
-        return PortResult(port=port, open=False, service_hint=service_hint(port))
+        if not banner and port in {80, 8000, 8080, 9000}:
+            banner = probe_http_banner(hostname, port, timeout)
+        return PortResult(
+            host=hostname,
+            port=port,
+            open=True,
+            state="open",
+            reason="tcp-connect",
+            latency_ms=latency_ms,
+            banner=banner,
+            service_hint=hint,
+            service_version=infer_service_version(port, banner),
+            scanned_at=scanned_at,
+        )
+    except ConnectionRefusedError:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return PortResult(host=hostname, port=port, open=False, state="closed", reason="connection-refused", latency_ms=latency_ms, service_hint=hint, scanned_at=scanned_at)
+    except TimeoutError:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return PortResult(host=hostname, port=port, open=False, state="filtered", reason="timeout", latency_ms=latency_ms, service_hint=hint, scanned_at=scanned_at)
+    except OSError as exc:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        reason = "network-unreachable" if getattr(exc, "winerror", None) in {10051, 10065} else type(exc).__name__
+        return PortResult(host=hostname, port=port, open=False, state="closed", reason=reason, latency_ms=latency_ms, service_hint=hint, scanned_at=scanned_at)
 
 
 def scan_ports(hostname: str, ports: Iterable[int], timeout: int) -> list[PortResult]:
@@ -1095,8 +1182,7 @@ def scan_ports(hostname: str, ports: Iterable[int], timeout: int) -> list[PortRe
         futures = [executor.submit(scan_port, hostname, port, timeout) for port in port_list]
         for future in as_completed(futures):
             result = future.result()
-            if result.open:
-                results.append(result)
+            results.append(result)
     return sorted(results, key=lambda item: item.port)
 
 
@@ -1688,7 +1774,7 @@ INDEX_HTML = r"""<!doctype html>
   <header><div class="wrap topbar"><div><h1>BG Bug Scout</h1><p class="subtitle">Authorized scanner for web bugs, ports, GraphQL, backend responses, and risk signals. Local only.</p></div><div class="actions"><button class="secondary" id="updateBtn">Update</button><button class="secondary" id="downloadBtn" disabled>JSON</button><button class="secondary" id="csvBtn" disabled>CSV</button><button class="secondary" id="htmlBtn" disabled>HTML</button></div></div></header>
   <main class="wrap">
     <section class="panel">
-      <label for="target">Authorized target URL</label><input id="target" placeholder="https://example.com" autocomplete="off">
+      <label for="target">Authorized target URL or IP</label><input id="target" placeholder="https://example.com or 203.0.113.5" autocomplete="off">
       <div class="row"><div><label for="maxPages">Max pages</label><input id="maxPages" type="number" min="1" value="8"></div><div><label for="timeout">Timeout sec</label><input id="timeout" type="number" min="2" max="20" value="8"></div></div>
       <div class="checkrow"><input id="scanPorts" type="checkbox" checked><span>Auto port scan</span></div>
       <label for="ports" style="margin-top:14px">Ports</label><input id="ports" placeholder="common, or 80,443,8000-8010">
@@ -1706,7 +1792,7 @@ INDEX_HTML = r"""<!doctype html>
     function card(title, badge, body, klass = "response") { return `<article class="${klass}"><div class="item-title"><span>${escapeHtml(title)}</span><span class="badge ${escapeHtml(badge)}">${escapeHtml(badge)}</span></div>${body}</article>`; }
     function renderFindings(report) { if (!report.findings.length) { output.className = "empty"; output.textContent = "No findings from these checks."; return; } output.className = ""; output.innerHTML = report.findings.map((finding) => card(finding.title, finding.severity, `<div class="url">${escapeHtml(finding.url)}</div><div class="detail">${escapeHtml(finding.category)}: ${escapeHtml(finding.detail)}</div>${finding.evidence ? `<div class="evidence">${escapeHtml(finding.evidence)}</div>` : ""}${finding.remediation ? `<div class="remediation"><strong>Fix:</strong> ${escapeHtml(finding.remediation)}</div>` : ""}`, "finding")).join(""); }
     function renderPages(report) { if (!report.pages.length) { output.className = "empty"; output.textContent = "No pages crawled."; return; } output.className = ""; output.innerHTML = report.pages.map((page) => card(page.title || "Untitled page", "info", `<div class="url">${escapeHtml(page.url)}</div>${page.error ? `<div class="detail">${escapeHtml(page.error)}</div>` : ""}<div class="detail">${escapeHtml(page.status || "error")} ${escapeHtml(page.content_type || "unknown content type")}</div><div class="detail">${page.links.length} link(s), ${page.forms.length} form(s), ${page.scripts.length} script(s)</div>`, "page")).join(""); }
-    function renderPorts(report) { if (!report.ports.length) { output.className = "empty"; output.textContent = "No open ports found in the selected scan set."; return; } output.className = ""; output.innerHTML = report.ports.map((port) => card(`Port ${port.port}`, "info", `<div class="detail">${escapeHtml(port.service_hint)}</div>${port.banner ? `<div class="evidence">${escapeHtml(port.banner)}</div>` : ""}`, "port")).join(""); }
+    function renderPorts(report) { if (!report.ports.length) { output.className = "empty"; output.textContent = "No port scan results captured."; return; } output.className = ""; output.innerHTML = report.ports.map((port) => card(`${escapeHtml(port.host || "")}:${escapeHtml(port.port)}/${escapeHtml(port.protocol || "tcp")}`, port.open ? "info" : "low", `<div class="detail"><strong>State:</strong> ${escapeHtml(port.state)} (${escapeHtml(port.reason || "unknown")})</div><div class="detail"><strong>Service:</strong> ${escapeHtml(port.service_hint || "unknown")} ${escapeHtml(port.service_version || "")}</div><div class="detail"><strong>Latency:</strong> ${escapeHtml(port.latency_ms || 0)}ms</div>${port.banner ? `<div class="evidence">${escapeHtml(port.banner)}</div>` : ""}`, "port")).join(""); }
     function renderIntel(report) { const tls = report.tls || {}, discoveries = report.discovery || []; output.className = ""; output.innerHTML = card("TLS Certificate", tls.error ? "medium" : "info", `<div class="detail"><strong>Host:</strong> ${escapeHtml(tls.host || report.target)}</div>${tls.reason ? `<div class="detail">${escapeHtml(tls.reason)}</div>` : ""}${tls.error ? `<div class="evidence">${escapeHtml(tls.error)}</div>` : ""}${tls.not_after ? `<div class="detail"><strong>Expires:</strong> ${escapeHtml(tls.not_after)}</div>` : ""}`) + discoveries.map((item) => card(`${item.url}`, item.status && item.status < 404 ? "info" : "low", `<div class="detail">${escapeHtml(item.status || "error")} ${escapeHtml(item.content_type || "")}</div>`)).join(""); }
     function renderResponses(report) { const responses = report.responses || []; if (!responses.length) { output.className = "empty"; output.textContent = "No backend server responses captured."; return; } output.className = ""; output.innerHTML = responses.map((response) => { const keywords = response.keyword_matches && response.keyword_matches.length ? response.keyword_matches.map((item) => `<span class="pill">${escapeHtml(item)}</span>`).join("") : `<span class="pill">no keyword match</span>`; return card(response.url, response.soft_404 ? "low" : "info", `<div class="detail"><strong>Status:</strong> ${escapeHtml(response.status || "error")}</div><div class="detail"><strong>Content-Type:</strong> ${escapeHtml(response.content_type || "missing")}</div><div class="detail"><strong>File signature:</strong> ${escapeHtml(response.file_signature || "unknown")}</div><div class="detail"><strong>Body size:</strong> ${escapeHtml(response.body_size)} bytes</div><div class="evidence">sha256:${escapeHtml(response.content_hash || "empty")}</div><div class="pillrow">${keywords}</div>${response.soft_404 ? `<div class="detail"><strong>Soft 404:</strong> ${escapeHtml(response.soft_404_reason)}</div>` : ""}<div class="detail"><strong>Decoded backend response:</strong></div><div class="evidence body-preview">${escapeHtml(response.response_body || "")}${response.response_body_truncated ? "\n...[truncated]" : ""}</div>`); }).join(""); }
     function renderReport() { renderSummary(latestReport); if (!latestReport) return; if (activeView === "pages") renderPages(latestReport); else if (activeView === "ports") renderPorts(latestReport); else if (activeView === "responses") renderResponses(latestReport); else if (activeView === "intel") renderIntel(latestReport); else renderFindings(latestReport); }
