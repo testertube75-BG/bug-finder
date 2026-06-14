@@ -320,13 +320,15 @@ def configure_logging(level: int | str = DEFAULT_CONFIG.log_level) -> None:
     if logging.getLogger().handlers:
         return
     resolved_level = logging.getLevelName(level) if isinstance(level, str) else level
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    try:
+        handlers.insert(0, logging.FileHandler(DEFAULT_CONFIG.log_file, encoding="utf-8"))
+    except OSError as exc:
+        LOGGER.warning("File logging disabled: %s", exc)
     logging.basicConfig(
         level=resolved_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(DEFAULT_CONFIG.log_file, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=handlers,
     )
 
 
