@@ -38,6 +38,18 @@ MAX_PAGES_LIMIT: Final[int | None] = DEFAULT_CONFIG.max_pages_limit
 MAX_PORT_WORKERS: Final[int | None] = DEFAULT_CONFIG.max_workers
 BODY_PREVIEW_CHARS: Final[int | None] = DEFAULT_CONFIG.response_preview_chars
 USER_AGENT: Final[str] = "BGBugScout/0.2 authorized-local-scanner"
+UPDATE_RAW_BASE_URL: Final[str] = "https://raw.githubusercontent.com/testertube75-BG/bug-finder/main"
+UPDATE_FILES: Final[tuple[str, ...]] = (
+    "app.py",
+    "config.py",
+    "rate_limiter.py",
+    "API.md",
+    "README.md",
+    "tests/test_app.py",
+    "tests/test_bug_scout.py",
+    "tests/test_scan.py",
+    ".github/workflows/test.yml",
+)
 
 SEVERITY_ORDER: Final[dict[str, int]] = {
     "critical": 0,
@@ -1326,6 +1338,70 @@ def format_terminal_report(report: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def sha256_text(text: str) -> str:
+    """Return a SHA-256 hash for UTF-8 text."""
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def fetch_remote_update_file(relative_path: str, timeout: int = DEFAULT_CONFIG.request_timeout) -> str:
+    """Fetch one tracked project file from the GitHub main branch."""
+
+    safe_path = "/".join(urllib.parse.quote(part) for part in relative_path.split("/"))
+    request = urllib.request.Request(
+        f"{UPDATE_RAW_BASE_URL}/{safe_path}",
+        headers={"User-Agent": USER_AGENT, "Accept": "text/plain,*/*"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def local_file_text(relative_path: str) -> str:
+    """Read one local tracked project file if it exists."""
+
+    path = Path(relative_path)
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def build_update_plan(remote_files: Mapping[str, str], local_files: Mapping[str, str]) -> list[dict[str, str]]:
+    """Compare local and remote text maps and return changed files."""
+
+    updates: list[dict[str, str]] = []
+    for relative_path, remote_text in remote_files.items():
+        local_text = local_files.get(relative_path, "")
+        if sha256_text(remote_text) != sha256_text(local_text):
+            updates.append(
+                {
+                    "path": relative_path,
+                    "local_sha256": sha256_text(local_text) if local_text else "",
+                    "remote_sha256": sha256_text(remote_text),
+                }
+            )
+    return updates
+
+
+def check_for_updates(timeout: int = DEFAULT_CONFIG.request_timeout) -> dict[str, Any]:
+    """Check GitHub main for updates to tracked project files."""
+
+    remote_files = {relative_path: fetch_remote_update_file(relative_path, timeout) for relative_path in UPDATE_FILES}
+    local_files = {relative_path: local_file_text(relative_path) for relative_path in UPDATE_FILES}
+    updates = build_update_plan(remote_files, local_files)
+    return {"update_available": bool(updates), "files": updates, "source": UPDATE_RAW_BASE_URL}
+
+
+def apply_updates(timeout: int = DEFAULT_CONFIG.request_timeout) -> dict[str, Any]:
+    """Download changed tracked project files from GitHub main and replace local files."""
+
+    remote_files = {relative_path: fetch_remote_update_file(relative_path, timeout) for relative_path in UPDATE_FILES}
+    local_files = {relative_path: local_file_text(relative_path) for relative_path in UPDATE_FILES}
+    updates = build_update_plan(remote_files, local_files)
+    for update in updates:
+        path = Path(update["path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(remote_files[update["path"]], encoding="utf-8")
+    return {"updated": bool(updates), "files": updates, "source": UPDATE_RAW_BASE_URL}
+
+
 def scan_target(
     target: str,
     max_pages: int = 8,
@@ -1474,6 +1550,12 @@ class ScoutHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
+        if self.path == "/api/update":
+            try:
+                self.send_json(HTTPStatus.OK, check_for_updates())
+            except OSError as exc:
+                self.send_json(HTTPStatus.BAD_GATEWAY, {"error": f"Update check failed: {exc}"})
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_OPTIONS(self) -> None:
@@ -1483,6 +1565,13 @@ class ScoutHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.NO_CONTENT)
             self.send_header("Allow", "OPTIONS, POST")
             self.send_header("Access-Control-Allow-Methods", "OPTIONS, POST")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+            return
+        if self.path == "/api/update":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Allow", "GET, OPTIONS, POST")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS, POST")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
             return
@@ -1504,6 +1593,12 @@ class ScoutHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         """Handle scan requests from the browser UI."""
 
+        if self.path == "/api/update":
+            try:
+                self.send_json(HTTPStatus.OK, apply_updates())
+            except OSError as exc:
+                self.send_json(HTTPStatus.BAD_GATEWAY, {"error": f"Update failed: {exc}"})
+            return
         if self.path != "/api/scan":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -1590,7 +1685,7 @@ INDEX_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-  <header><div class="wrap topbar"><div><h1>BG Bug Scout</h1><p class="subtitle">Authorized scanner for web bugs, ports, GraphQL, backend responses, and risk signals. Local only.</p></div><div class="actions"><button class="secondary" id="downloadBtn" disabled>JSON</button><button class="secondary" id="csvBtn" disabled>CSV</button><button class="secondary" id="htmlBtn" disabled>HTML</button></div></div></header>
+  <header><div class="wrap topbar"><div><h1>BG Bug Scout</h1><p class="subtitle">Authorized scanner for web bugs, ports, GraphQL, backend responses, and risk signals. Local only.</p></div><div class="actions"><button class="secondary" id="updateBtn">Update</button><button class="secondary" id="downloadBtn" disabled>JSON</button><button class="secondary" id="csvBtn" disabled>CSV</button><button class="secondary" id="htmlBtn" disabled>HTML</button></div></div></header>
   <main class="wrap">
     <section class="panel">
       <label for="target">Authorized target URL</label><input id="target" placeholder="https://example.com" autocomplete="off">
@@ -1604,7 +1699,7 @@ INDEX_HTML = r"""<!doctype html>
     <section><div class="summary" id="summary"></div><div class="tabs"><button class="tab active" data-view="findings">Findings</button><button class="tab" data-view="intel">Intel</button><button class="tab" data-view="responses">Responses</button><button class="tab" data-view="pages">Pages</button><button class="tab" data-view="ports">Ports</button></div><div id="output" class="empty">Scan results will appear here.</div></section>
   </main>
   <script>
-    const scanBtn = document.querySelector("#scanBtn"), downloadBtn = document.querySelector("#downloadBtn"), csvBtn = document.querySelector("#csvBtn"), htmlBtn = document.querySelector("#htmlBtn"), output = document.querySelector("#output"), summary = document.querySelector("#summary"), tabs = document.querySelectorAll(".tab");
+    const scanBtn = document.querySelector("#scanBtn"), updateBtn = document.querySelector("#updateBtn"), downloadBtn = document.querySelector("#downloadBtn"), csvBtn = document.querySelector("#csvBtn"), htmlBtn = document.querySelector("#htmlBtn"), output = document.querySelector("#output"), summary = document.querySelector("#summary"), tabs = document.querySelectorAll(".tab");
     let latestReport = null, activeView = "findings";
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
     function renderSummary(report) { if (!report) { summary.innerHTML = ""; return; } const items = [["Critical", report.summary.critical], ["High", report.summary.high], ["Medium", report.summary.medium], ["Low", report.summary.low], ["Responses", report.summary.responses || 0], ["Intel", report.summary.discovery || 0]]; summary.innerHTML = items.map(([label, value]) => `<div class="metric"><strong>${value}</strong><span>${label}</span></div>`).join(""); }
@@ -1617,6 +1712,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderReport() { renderSummary(latestReport); if (!latestReport) return; if (activeView === "pages") renderPages(latestReport); else if (activeView === "ports") renderPorts(latestReport); else if (activeView === "responses") renderResponses(latestReport); else if (activeView === "intel") renderIntel(latestReport); else renderFindings(latestReport); }
     tabs.forEach((tab) => tab.addEventListener("click", () => { tabs.forEach((item) => item.classList.remove("active")); tab.classList.add("active"); activeView = tab.dataset.view; renderReport(); }));
     scanBtn.addEventListener("click", async () => { const body = { target: document.querySelector("#target").value.trim(), max_pages: Number(document.querySelector("#maxPages").value), timeout: Number(document.querySelector("#timeout").value), scan_ports: document.querySelector("#scanPorts").checked, ports: document.querySelector("#ports").value.trim(), ssrf_callback: document.querySelector("#ssrf").value.trim() }; scanBtn.disabled = true; downloadBtn.disabled = true; csvBtn.disabled = true; htmlBtn.disabled = true; output.className = "empty"; output.textContent = "Scanning with safe probes..."; try { const response = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || "Scan failed"); latestReport = data; downloadBtn.disabled = false; csvBtn.disabled = false; htmlBtn.disabled = false; renderReport(); } catch (error) { latestReport = null; renderSummary(null); output.className = "empty"; output.textContent = error.message; } finally { scanBtn.disabled = false; } });
+    updateBtn.addEventListener("click", async () => { updateBtn.disabled = true; output.className = "empty"; output.textContent = "Checking GitHub for updates..."; try { const response = await fetch("/api/update", { method: "POST" }); const data = await response.json(); if (!response.ok) throw new Error(data.error || "Update failed"); output.className = "empty"; output.textContent = data.updated ? `Updated ${data.files.length} file(s). Restart the app to load Python changes.` : "No updates found."; } catch (error) { output.className = "empty"; output.textContent = error.message; } finally { updateBtn.disabled = false; } });
     downloadBtn.addEventListener("click", () => { if (!latestReport) return; const blob = new Blob([JSON.stringify(latestReport, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = `bug-scout-${new Date().toISOString().slice(0, 10)}.json`; link.click(); URL.revokeObjectURL(url); });
     csvBtn.addEventListener("click", () => { if (!latestReport) return; const blob = new Blob([latestReport.exports?.findings_csv || ""], { type: "text/csv" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = `bug-scout-${new Date().toISOString().slice(0, 10)}.csv`; link.click(); URL.revokeObjectURL(url); });
     htmlBtn.addEventListener("click", () => { if (!latestReport) return; const blob = new Blob([latestReport.exports?.html_report || ""], { type: "text/html" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = `bug-scout-${new Date().toISOString().slice(0, 10)}.html`; link.click(); URL.revokeObjectURL(url); });
@@ -1644,6 +1740,17 @@ def run_terminal_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_update_command(apply: bool) -> int:
+    """Check for or apply GitHub updates from terminal mode."""
+
+    configure_logging()
+    result = apply_updates() if apply else check_for_updates()
+    print(json.dumps(result, indent=2))
+    if apply and result.get("updated"):
+        print("Update applied. Restart the app to load changed Python files.")
+    return 0
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build command-line arguments for server and terminal scan modes."""
 
@@ -1657,6 +1764,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", choices=["text", "json", "csv", "html"], default="text", help="Terminal output format")
     parser.add_argument("--output-file", default="bug-scout-report.html", help="Path for --output html")
     parser.add_argument("--log-level", default=DEFAULT_CONFIG.log_level, help="Logging level")
+    parser.add_argument("--update", action="store_true", help="Check GitHub main for app file updates")
+    parser.add_argument("--apply-update", action="store_true", help="Download and replace changed files from GitHub main")
     return parser
 
 
@@ -1665,6 +1774,10 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.apply_update:
+        return run_update_command(apply=True)
+    if args.update:
+        return run_update_command(apply=False)
     if args.target:
         return run_terminal_scan(args)
     configure_logging()

@@ -7,7 +7,10 @@
 | `GET` | `/` | `200 OK` | Serves the local scanner UI. |
 | `GET` | `/index.html` | `200 OK` | Serves the local scanner UI. |
 | `POST` | `/api/scan` | `200 OK` | Runs a scan and returns a JSON report. |
+| `GET` | `/api/update` | `200 OK` | Checks GitHub `main` for changed tracked files. |
+| `POST` | `/api/update` | `200 OK` | Downloads changed tracked files from GitHub `main`. |
 | `OPTIONS` | `/api/scan` | `204 No Content` | Returns allowed methods for API clients. |
+| `OPTIONS` | `/api/update` | `204 No Content` | Returns allowed update methods. |
 | `DELETE` | Any path | `405 Method Not Allowed` | Not supported because reports are not stored server-side. |
 
 ## POST /api/scan
@@ -134,3 +137,43 @@ Plugin files can be placed in `plugins/*.py`. Supported hooks:
 `500 Internal Server Error` is returned for unexpected scan orchestration failures.
 
 Only scan systems you own or have explicit permission to test.
+
+## Update API
+
+### GET /api/update
+
+Checks whether tracked local files differ from GitHub `main`.
+
+```json
+{
+  "update_available": true,
+  "files": [
+    {
+      "path": "app.py",
+      "local_sha256": "local-hash",
+      "remote_sha256": "remote-hash"
+    }
+  ],
+  "source": "https://raw.githubusercontent.com/testertube75-BG/bug-finder/main"
+}
+```
+
+### POST /api/update
+
+Downloads changed files from GitHub `main` and overwrites the local tracked files.
+
+```json
+{
+  "updated": true,
+  "files": [
+    {
+      "path": "app.py",
+      "local_sha256": "local-hash",
+      "remote_sha256": "remote-hash"
+    }
+  ],
+  "source": "https://raw.githubusercontent.com/testertube75-BG/bug-finder/main"
+}
+```
+
+Restart the app after updating Python files.

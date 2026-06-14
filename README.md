@@ -96,6 +96,23 @@ python app.py --target https://example.com --output csv
 python app.py --target https://example.com --output html --output-file report.html
 ```
 
+## Update From GitHub
+
+Use the **Update** button in the web UI to check GitHub `main` and replace changed project files locally.
+
+Terminal commands:
+
+```bash
+python app.py --update
+python app.py --apply-update
+```
+
+After an update changes Python files, restart the app:
+
+```bash
+python app.py
+```
+
 ## Custom Plugins
 
 Create Python files in a local `plugins/` folder. A plugin can expose `analyze_page(page, body_text)` and return `Finding` objects or dictionaries with Finding fields.
@@ -151,6 +168,8 @@ Edit [config.py](config.py) to change runtime defaults.
 | --- | --- | --- |
 | `GET` | `/` or `/index.html` | Opens the scanner UI |
 | `POST` | `/api/scan` | Runs a scan and returns JSON |
+| `GET` | `/api/update` | Checks GitHub `main` for changed app files |
+| `POST` | `/api/update` | Downloads changed files from GitHub `main` |
 | `OPTIONS` | `/api/scan` | May be used by clients to inspect allowed API methods |
 | `DELETE` | Any path | Not supported; no scan data is stored server-side |
 

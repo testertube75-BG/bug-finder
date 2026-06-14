@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app import Finding, MLDetector, ResponseAnalysis, build_arg_parser, findings_to_csv, normalize_url, parse_ports, report_to_html, ScanConfig, TargetError
+from app import Finding, MLDetector, ResponseAnalysis, build_arg_parser, build_update_plan, findings_to_csv, normalize_url, parse_ports, report_to_html, ScanConfig, TargetError
 from rate_limiter import RateLimiter
 
 
@@ -76,6 +76,19 @@ class TestScanConfig(unittest.TestCase):
         args = build_arg_parser().parse_args(["--target", "example.com", "--output", "json"])
         self.assertEqual(args.target, "example.com")
         self.assertEqual(args.output, "json")
+
+    def test_cli_parser_accepts_update_mode(self) -> None:
+        """CLI parser supports update checks."""
+
+        args = build_arg_parser().parse_args(["--update"])
+        self.assertTrue(args.update)
+
+    def test_build_update_plan_detects_changed_files(self) -> None:
+        """Updater compares local and remote file contents by hash."""
+
+        plan = build_update_plan({"app.py": "remote"}, {"app.py": "local"})
+        self.assertEqual(plan[0]["path"], "app.py")
+        self.assertNotEqual(plan[0]["local_sha256"], plan[0]["remote_sha256"])
 
 
 if __name__ == "__main__":
