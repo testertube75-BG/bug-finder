@@ -59,8 +59,6 @@ Scans an authorized web target and returns a JSON security report.
 
 `400 Bad Request` is returned for invalid JSON, invalid URLs, private-network targets, invalid ports, or more than 100 requested ports.
 
-`429 Too Many Requests` is returned when a client exceeds the local scan request rate limit.
-
 `500 Internal Server Error` is returned for unexpected scan orchestration failures.
 
 Only scan systems you own or have explicit permission to test.

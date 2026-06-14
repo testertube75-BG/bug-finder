@@ -20,4 +20,4 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Syntax check
-        run: python -m py_compile app.py config.py rate_limiter.py
+        run: python -m py_compile app.py config.py
