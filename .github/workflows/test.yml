@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -20,4 +23,4 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Syntax check
-        run: python -m py_compile app.py config.py
+        run: python -m py_compile app.py config.py rate_limiter.py
