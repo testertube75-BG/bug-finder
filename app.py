@@ -1,38 +1,109 @@
 from __future__ import annotations
 
-import html
 import hashlib
+import html
 import ipaddress
 import json
+import logging
 import re
 import socket
 import ssl
+import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Final, Iterable, Mapping, Self, TypedDict
+
+from config import DEFAULT_CONFIG
 
 
-HOST = "127.0.0.1"
-PORT = 8765
-MAX_BODY_BYTES = 600_000
-MAX_PAGES_LIMIT = 30
-USER_AGENT = "BGBugScout/0.1 authorized-local-scanner"
+HOST: Final[str] = DEFAULT_CONFIG.host
+PORT: Final[int] = DEFAULT_CONFIG.port
+MAX_BODY_BYTES: Final[int] = DEFAULT_CONFIG.max_body_bytes
+MAX_PAGES_LIMIT: Final[int] = DEFAULT_CONFIG.max_pages_limit
+MAX_PORT_WORKERS: Final[int] = DEFAULT_CONFIG.max_workers
+BODY_PREVIEW_CHARS: Final = 4_000
+USER_AGENT: Final[str] = "BGBugScout/0.2 authorized-local-scanner"
 
-SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-COMMON_PORTS = [21, 22, 25, 53, 80, 110, 143, 443, 445, 465, 587, 993, 995, 1433, 1521, 2049, 2375, 3000, 3306, 3389, 5000, 5432, 5601, 5900, 6379, 8000, 8080, 8443, 9000, 9200, 9300, 11211, 27017]
-RISKY_FILES = ["/.env", "/.git/config", "/backup.zip", "/db.sql", "/phpinfo.php", "/server-status", "/actuator/env", "/actuator/heapdump"]
-XSS_CANARY = "bjxss-9f4b7"
-SQLI_CANARY = "bjsqli'"
-TRAVERSAL_CANARY = "../../../../etc/passwd"
-SSRF_PARAM_NAMES = {"url", "uri", "path", "dest", "destination", "redirect", "next", "target", "callback", "webhook", "feed", "image", "file", "host", "domain", "site", "continue"}
-BODY_PREVIEW_CHARS = 4000
-KEYWORD_PATTERNS = {
+SEVERITY_ORDER: Final[dict[str, int]] = {
+    "critical": 0,
+    "high": 1,
+    "medium": 2,
+    "low": 3,
+    "info": 4,
+}
+COMMON_PORTS: Final[tuple[int, ...]] = (
+    21,
+    22,
+    25,
+    53,
+    80,
+    110,
+    143,
+    443,
+    445,
+    465,
+    587,
+    993,
+    995,
+    1433,
+    1521,
+    2049,
+    2375,
+    3000,
+    3306,
+    3389,
+    5000,
+    5432,
+    5601,
+    5900,
+    6379,
+    8000,
+    8080,
+    8443,
+    9000,
+    9200,
+    9300,
+    11211,
+    27017,
+)
+RISKY_FILES: Final[tuple[str, ...]] = (
+    "/.env",
+    "/.git/config",
+    "/backup.zip",
+    "/db.sql",
+    "/phpinfo.php",
+    "/server-status",
+    "/actuator/env",
+    "/actuator/heapdump",
+)
+SSRF_PARAM_NAMES: Final[set[str]] = {
+    "url",
+    "uri",
+    "path",
+    "dest",
+    "destination",
+    "redirect",
+    "next",
+    "target",
+    "callback",
+    "webhook",
+    "feed",
+    "image",
+    "file",
+    "host",
+    "domain",
+    "site",
+    "continue",
+}
+KEYWORD_PATTERNS: Final[dict[str, str]] = {
     "not-found": r"\b(404|not found|page not found|does not exist|could not be found)\b",
     "forbidden": r"\b(403|forbidden|access denied|unauthorized)\b",
     "server-error": r"\b(500|internal server error|service unavailable|bad gateway)\b",
@@ -41,22 +112,62 @@ KEYWORD_PATTERNS = {
     "sql-dump": r"\b(create\s+table|insert\s+into|drop\s+table|alter\s+table)\b",
     "secret": r"\b(api[_-]?key|secret|private[_-]?key|access[_-]?token|client[_-]?secret)\b",
     "env-secret": r"(?im)^\s*(db_password|database_password|app_key|aws_secret|aws_secret_access_key)\s*=",
-    "db-password": r"(?im)^\s*db_password\s*=",
-    "app-key": r"(?im)^\s*app_key\s*=",
-    "aws-secret": r"(?im)^\s*(aws_secret|aws_secret_access_key)\s*=",
     "password": r"\b(password|passwd|pwd)\b",
     "admin": r"\b(admin|administrator|dashboard|control panel)\b",
     "login": r"\b(login|sign in|signin|log in)\b",
     "directory-listing": r"\b(index of /|parent directory|directory listing)\b",
 }
-DOTENV_SIGNATURE_RE = re.compile(
+DOTENV_SIGNATURE_RE: Final = re.compile(
     r"(?im)^\s*(app_key|db_password|database_url|database_password|aws_secret|aws_secret_access_key|secret_key|jwt_secret)\s*=\s*\S+"
 )
-SQL_DUMP_SIGNATURE_RE = re.compile(r"(?is)\bcreate\s+table\b.+\binsert\s+into\b|\binsert\s+into\b.+\bcreate\s+table\b")
+SQL_DUMP_SIGNATURE_RE: Final = re.compile(
+    r"(?is)\bcreate\s+table\b.+\binsert\s+into\b|\binsert\s+into\b.+\bcreate\s+table\b"
+)
+
+LOGGER = logging.getLogger("bug_finder")
 
 
-@dataclass
+class BugScoutError(Exception):
+    """Base exception for scanner-specific failures."""
+
+
+class TargetError(BugScoutError, ValueError):
+    """Raised when a target URL or target-related scan option is invalid."""
+
+
+class ScanError(BugScoutError):
+    """Raised when scan execution fails after configuration has been validated."""
+
+
+class ScanRequest(TypedDict):
+    """JSON-compatible scan request accepted by the API layer."""
+
+    target: str
+    max_pages: int
+    timeout: int
+    scan_ports_enabled: bool
+    custom_ports: str
+    ssrf_callback: str
+
+
+class ReportSummary(TypedDict):
+    """Severity and artifact counts returned in a scan report."""
+
+    pages: int
+    responses: int
+    findings: int
+    critical: int
+    high: int
+    medium: int
+    low: int
+    info: int
+    discovery: int
+
+
+@dataclass(slots=True)
 class Finding:
+    """A security or quality signal found while scanning a target."""
+
     title: str
     severity: str
     url: str
@@ -66,8 +177,10 @@ class Finding:
     remediation: str = ""
 
 
-@dataclass
+@dataclass(slots=True)
 class ResponseAnalysis:
+    """Normalized response metadata used for duplicate, exposure, and keyword checks."""
+
     url: str
     status: int | None = None
     content_type: str = ""
@@ -86,8 +199,10 @@ class ResponseAnalysis:
     soft_404_reason: str = ""
 
 
-@dataclass
+@dataclass(slots=True)
 class PageResult:
+    """A fetched page plus parsed HTML artifacts and response analysis."""
+
     url: str
     status: int | None = None
     content_type: str = ""
@@ -100,16 +215,55 @@ class PageResult:
     response: ResponseAnalysis | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class PortResult:
+    """Result for one TCP port probe."""
+
     port: int
     open: bool
     banner: str = ""
     service_hint: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class ScanConfig:
+    """Validated scan options accepted by the API and CLI entrypoints."""
+
+    target: str
+    max_pages: int
+    timeout: int
+    scan_ports: bool
+    ports: tuple[int, ...]
+    ssrf_callback: str = ""
+
+    @classmethod
+    def from_values(
+        cls,
+        target: str,
+        max_pages: int,
+        timeout: int,
+        scan_ports: bool,
+        ports: str,
+        ssrf_callback: str,
+    ) -> Self:
+        """Create a bounded configuration from untrusted user-supplied values."""
+
+        return cls(
+            target=normalize_url(target),
+            max_pages=max(1, min(int(max_pages), MAX_PAGES_LIMIT)),
+            timeout=max(2, min(int(timeout), 20)),
+            scan_ports=bool(scan_ports),
+            ports=parse_ports(ports),
+            ssrf_callback=ssrf_callback.strip(),
+        )
+
+
 class PageParser(HTMLParser):
+    """Extract links, forms, scripts, and title text from a single HTML page."""
+
     def __init__(self, base_url: str) -> None:
+        """Create a parser that resolves relative URLs against the supplied base URL."""
+
         super().__init__()
         self.base_url = base_url
         self.links: list[str] = []
@@ -119,6 +273,8 @@ class PageParser(HTMLParser):
         self.title_parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Collect relevant attributes while the parser streams through HTML."""
+
         attr = {name.lower(): value or "" for name, value in attrs}
         if tag == "a" and attr.get("href"):
             self.links.append(urllib.parse.urljoin(self.base_url, attr["href"]))
@@ -140,48 +296,132 @@ class PageParser(HTMLParser):
             self._in_title = True
 
     def handle_endtag(self, tag: str) -> None:
+        """Track the end of the document title."""
+
         if tag == "title":
             self._in_title = False
 
     def handle_data(self, data: str) -> None:
+        """Append title text while inside the title element."""
+
         if self._in_title:
             self.title_parts.append(data.strip())
 
     @property
     def title(self) -> str:
+        """Return the normalized page title."""
+
         return " ".join(part for part in self.title_parts if part).strip()
 
 
+def configure_logging(level: int | str = DEFAULT_CONFIG.log_level) -> None:
+    """Configure console and file logging once for local server execution."""
+
+    if logging.getLogger().handlers:
+        return
+    resolved_level = logging.getLevelName(level) if isinstance(level, str) else level
+    logging.basicConfig(
+        level=resolved_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(DEFAULT_CONFIG.log_file, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+
 def normalize_url(raw_url: str) -> str:
-    url = raw_url.strip()
-    if not url:
-        raise ValueError("Target URL is required.")
-    if not re.match(r"^https?://", url, re.I):
-        url = f"https://{url}"
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("Use a valid http:// or https:// URL.")
-    return urllib.parse.urlunparse(parsed._replace(fragment=""))
+    """Normalize and validate an HTTP or HTTPS target URL."""
+
+    try:
+        url = raw_url.strip()
+        if not url:
+            raise TargetError("Target URL is required.")
+        if re.search(r"\s", url):
+            raise TargetError(f"Invalid URL format: {raw_url}")
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            url = f"https://{url}"
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname or "." not in parsed.hostname:
+            raise TargetError(f"Invalid URL format: {raw_url}")
+        return urllib.parse.urlunparse(parsed._replace(fragment=""))
+    except TargetError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise TargetError(f"URL normalization failed: {exc}") from exc
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    """Parse common JSON/form boolean values."""
+
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def parse_ports(raw_ports: str) -> tuple[int, ...]:
+    """Parse comma-separated ports and ranges into a bounded sorted tuple."""
+
+    if not raw_ports.strip() or raw_ports.strip().lower() == "common":
+        return COMMON_PORTS
+    ports: set[int] = set()
+    try:
+        for token in raw_ports.split(","):
+            item = token.strip()
+            if not item:
+                continue
+            if "-" in item:
+                start_text, end_text = item.split("-", 1)
+                start, end = int(start_text), int(end_text)
+                if start > end:
+                    raise TargetError(f"Invalid port range: {item}")
+                ports.update(range(start, end + 1))
+            else:
+                ports.add(int(item))
+    except ValueError as exc:
+        raise TargetError(f"Invalid port value: {raw_ports}") from exc
+    invalid = [port for port in ports if port < 1 or port > 65535]
+    if invalid:
+        raise TargetError(f"Invalid port number: {invalid[0]}")
+    if len(ports) > 100:
+        raise TargetError("A scan can include at most 100 ports.")
+    return tuple(sorted(ports))
 
 
 def same_origin(url: str, origin: urllib.parse.ParseResult) -> bool:
+    """Return True when a URL shares scheme and network location with origin."""
+
     parsed = urllib.parse.urlparse(url)
     return (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
 
 
 def is_private_host(hostname: str) -> bool:
+    """Resolve a hostname and identify loopback, private, link-local, or multicast addresses."""
+
     try:
-        for info in socket.getaddrinfo(hostname, None):
-            ip = ipaddress.ip_address(info[4][0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
-                return True
-    except Exception:
+        addresses = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        LOGGER.warning("Could not resolve hostname: %s", hostname)
         return False
+    except OSError as exc:
+        LOGGER.warning("Host resolution failed for %s: %s", hostname, exc)
+        return False
+
+    for info in addresses:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+            return True
     return False
 
 
-def fetch_page(url: str, timeout: int, method: str = "GET", data: bytes | None = None) -> tuple[PageResult, bytes]:
-    request = urllib.request.Request(
+def build_request(url: str, method: str, data: bytes | None) -> urllib.request.Request:
+    """Build a scanner HTTP request with conservative default headers."""
+
+    return urllib.request.Request(
         url,
         data=data,
         method=method,
@@ -191,7 +431,13 @@ def fetch_page(url: str, timeout: int, method: str = "GET", data: bytes | None =
             "Content-Type": "application/x-www-form-urlencoded",
         },
     )
+
+
+def fetch_page(url: str, timeout: int, method: str = "GET", data: bytes | None = None) -> tuple[PageResult, bytes]:
+    """Fetch a URL and return metadata plus a capped response body."""
+
     result = PageResult(url=url)
+    request = build_request(url, method, data)
     try:
         context = ssl.create_default_context()
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
@@ -199,24 +445,38 @@ def fetch_page(url: str, timeout: int, method: str = "GET", data: bytes | None =
             result.status = response.status
             result.headers = {key.lower(): value for key, value in response.headers.items()}
             result.content_type = result.headers.get("content-type", "")
+            LOGGER.debug("Fetched %s with status %s", result.url, result.status)
             return result, response.read(MAX_BODY_BYTES)
     except urllib.error.HTTPError as exc:
         result.status = exc.code
         result.headers = {key.lower(): value for key, value in exc.headers.items()}
         result.content_type = result.headers.get("content-type", "")
+        LOGGER.info("Fetched HTTP error response from %s: %s", url, exc.code)
         return result, exc.read(MAX_BODY_BYTES)
-    except Exception as exc:
+    except urllib.error.URLError as exc:
+        result.error = f"URLError: {exc.reason}"
+        LOGGER.warning("URL fetch failed for %s: %s", url, exc.reason)
+    except TimeoutError:
+        result.error = "TimeoutError: request timed out"
+        LOGGER.warning("URL fetch timed out for %s", url)
+    except OSError as exc:
         result.error = f"{type(exc).__name__}: {exc}"
-        return result, b""
+        LOGGER.warning("Network error fetching %s: %s", url, exc)
+    return result, b""
+
+
+def response_charset(content_type: str) -> str:
+    """Extract a declared charset from a Content-Type header."""
+
+    match = re.search(r"charset=([\w.-]+)", content_type, re.IGNORECASE)
+    return match.group(1) if match else "utf-8"
 
 
 def parse_html(result: PageResult, body: bytes) -> str:
-    charset = "utf-8"
-    match = re.search(r"charset=([\w.-]+)", result.content_type, re.I)
-    if match:
-        charset = match.group(1)
-    text = body.decode(charset, errors="replace")
-    if "html" in result.content_type.lower() or re.search(r"<html|<title|<form|<a\s", text, re.I):
+    """Decode a response and parse HTML artifacts when the body looks like HTML."""
+
+    text = body.decode(response_charset(result.content_type), errors="replace")
+    if "html" in result.content_type.lower() or re.search(r"<html|<title|<form|<a\s", text, re.IGNORECASE):
         parser = PageParser(result.url)
         parser.feed(text)
         result.links = sorted(set(parser.links))
@@ -227,45 +487,46 @@ def parse_html(result: PageResult, body: bytes) -> str:
 
 
 def normalize_content_type(content_type: str) -> str:
+    """Return a lowercase media type without parameters."""
+
     return content_type.split(";", 1)[0].strip().lower() or "unknown"
 
 
 def is_probably_text(content_type: str, body: bytes) -> bool:
+    """Detect whether a response body can safely be represented as text."""
+
     normalized = normalize_content_type(content_type)
     if normalized.startswith("text/"):
         return True
     if normalized in {"application/json", "application/xml", "application/javascript", "application/x-javascript", "image/svg+xml"}:
         return True
-    if any(token in normalized for token in ["html", "xml", "json", "javascript"]):
+    if any(token in normalized for token in ("html", "xml", "json", "javascript")):
         return True
     return b"\x00" not in body[:512]
 
 
 def detect_file_signature(body: bytes, content_type: str) -> str:
+    """Classify a response body by magic bytes and high-value textual signatures."""
+
     if not body:
         return "empty"
-    signatures = [
+    signatures: tuple[tuple[bytes, str], ...] = (
         (b"%PDF-", "PDF document"),
         (b"PK\x03\x04", "ZIP archive"),
-        (b"PK\x05\x06", "empty ZIP archive"),
         (b"\x89PNG\r\n\x1a\n", "PNG image"),
         (b"\xff\xd8\xff", "JPEG image"),
-        (b"GIF87a", "GIF image"),
-        (b"GIF89a", "GIF image"),
-        (b"\x1f\x8b\x08", "Gzip archive"),
-        (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
-        (b"Rar!\x1a\x07\x00", "RAR archive"),
         (b"SQLite format 3\x00", "SQLite database"),
         (b"MZ", "Windows executable"),
         (b"\x7fELF", "ELF executable"),
-    ]
+    )
     for prefix, label in signatures:
         if body.startswith(prefix):
             return label
+
     stripped = body[:512].lstrip()
     lowered = stripped.lower()
     text_sample = body[:8192].decode("utf-8", errors="ignore")
-    if lowered.startswith(b"<!doctype html") or lowered.startswith(b"<html") or b"<html" in lowered[:160]:
+    if lowered.startswith((b"<!doctype html", b"<html")) or b"<html" in lowered[:160]:
         return "HTML document"
     if DOTENV_SIGNATURE_RE.search(text_sample):
         return "dotenv/config file"
@@ -281,24 +542,26 @@ def detect_file_signature(body: bytes, content_type: str) -> str:
 
 
 def response_body_preview(body: bytes, body_text: str, content_type: str) -> tuple[str, bool]:
+    """Return a capped text or hex preview and whether the value was truncated."""
+
     if not body:
         return "", False
     if is_probably_text(content_type, body):
         text = body_text or body.decode("utf-8", errors="replace")
-        text = re.sub(r"\r\n?", "\n", text)
-        return text[:BODY_PREVIEW_CHARS], len(text) > BODY_PREVIEW_CHARS
+        normalized = re.sub(r"\r\n?", "\n", text)
+        return normalized[:BODY_PREVIEW_CHARS], len(normalized) > BODY_PREVIEW_CHARS
     return body[:160].hex(" "), len(body) > 160
 
 
 def find_keyword_matches(body_text: str) -> list[str]:
-    matches: list[str] = []
-    for label, pattern in KEYWORD_PATTERNS.items():
-        if re.search(pattern, body_text, re.I):
-            matches.append(label)
-    return matches
+    """Return labels for security-relevant patterns found in response text."""
+
+    return [label for label, pattern in KEYWORD_PATTERNS.items() if re.search(pattern, body_text, re.IGNORECASE)]
 
 
 def analyze_response(page: PageResult, body: bytes, body_text: str) -> ResponseAnalysis:
+    """Attach normalized response analysis to a page result."""
+
     preview, truncated = response_body_preview(body, body_text, page.content_type)
     analysis = ResponseAnalysis(
         url=page.url,
@@ -316,74 +579,59 @@ def analyze_response(page: PageResult, body: bytes, body_text: str) -> ResponseA
     return analysis
 
 
-def fetch_analyzed_page(url: str, timeout: int, method: str = "GET", data: bytes | None = None) -> tuple[PageResult, bytes, str]:
+def fetch_analyzed_page(url: str, timeout: int, method: str = "GET", data: bytes | None = None) -> tuple[PageResult, str]:
+    """Fetch, parse, and analyze a URL in one call."""
+
     page, body = fetch_page(url, timeout, method=method, data=data)
     body_text = parse_html(page, body) if body else ""
     analyze_response(page, body, body_text)
-    return page, body, body_text
+    return page, body_text
 
 
-def parse_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
+def add_finding(findings: list[Finding], **kwargs: str) -> None:
+    """Append a finding using keyword fields that match the Finding dataclass."""
+
+    findings.append(Finding(**kwargs))
 
 
-def response_words(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9][a-z0-9_-]{1,}", text.lower())[:5000])
+def check_headers(page: PageResult, findings: list[Finding]) -> None:
+    """Report missing or risky HTTP security headers."""
 
-
-def response_similarity(left_text: str, right_text: str) -> float:
-    left = response_words(left_text)
-    right = response_words(right_text)
-    if not left and not right:
-        return 1.0
-    if not left or not right:
-        return 0.0
-    return len(left & right) / len(left | right)
-
-
-def mark_soft_404(
-    page: PageResult,
-    body_text: str,
-    soft_404_page: PageResult | None,
-    soft_404_text: str,
-) -> bool:
-    if not page.response or not soft_404_page or not soft_404_page.response:
-        return False
-    if page.url == soft_404_page.url:
-        return False
-    if page.status != soft_404_page.status or not page.status or page.status >= 400:
-        return False
-
-    reasons: list[str] = []
-    if page.response.content_hash and page.response.content_hash == soft_404_page.response.content_hash:
-        reasons.append("identical response hash to random missing-path baseline")
-    else:
-        similarity = response_similarity(body_text, soft_404_text)
-        size_gap = abs(page.response.body_size - soft_404_page.response.body_size) / max(page.response.body_size, soft_404_page.response.body_size, 1)
-        if similarity >= 0.92 and size_gap <= 0.25:
-            reasons.append(f"body similarity {similarity:.2f} to random missing-path baseline")
-
-    if "not-found" in page.response.keyword_matches and page.status < 400:
-        reasons.append("not-found keyword with non-error HTTP status")
-
-    if reasons:
-        page.response.soft_404 = True
-        page.response.soft_404_reason = "; ".join(reasons)
-        return True
-    return False
+    if not page.headers or page.error:
+        return
+    required_headers: Mapping[str, tuple[str, str]] = {
+        "content-security-policy": ("Content Security Policy missing", "XSS impact can be higher without CSP."),
+        "x-content-type-options": ("X-Content-Type-Options missing", "MIME sniffing protection is not advertised."),
+        "referrer-policy": ("Referrer-Policy missing", "Sensitive URLs may leak through Referer headers."),
+    }
+    for header, (title, detail) in required_headers.items():
+        if header not in page.headers:
+            add_finding(
+                findings,
+                title=title,
+                severity="low",
+                url=page.url,
+                category="headers",
+                detail=detail,
+                remediation=f"Send a suitable {header} header.",
+            )
+    if urllib.parse.urlparse(page.url).scheme == "https" and "strict-transport-security" not in page.headers:
+        add_finding(
+            findings,
+            title="HSTS header missing",
+            severity="medium",
+            url=page.url,
+            category="headers",
+            detail="HTTPS responses should advertise Strict-Transport-Security.",
+            remediation="Send Strict-Transport-Security after confirming HTTPS is stable across the site.",
+        )
 
 
 def check_response_analysis(page: PageResult, findings: list[Finding]) -> None:
+    """Turn response fingerprints and keyword matches into actionable findings."""
+
     response = page.response
-    if not response:
-        return
-    if page.status is None or page.error:
+    if not response or page.status is None or page.error:
         return
     if response.normalized_content_type == "unknown":
         add_finding(
@@ -395,17 +643,6 @@ def check_response_analysis(page: PageResult, findings: list[Finding]) -> None:
             detail="The response did not include a Content-Type header.",
             remediation="Send an accurate Content-Type for every response.",
         )
-    if response.file_signature == "HTML document" and response.normalized_content_type not in {"text/html", "application/xhtml+xml", "unknown"}:
-        add_finding(
-            findings,
-            title="Content-Type and file signature mismatch",
-            severity="low",
-            url=page.url,
-            category="response",
-            detail="The body looks like HTML, but the Content-Type says something else.",
-            evidence=f"Content-Type={response.content_type}, signature={response.file_signature}",
-            remediation="Make the Content-Type match the actual body.",
-        )
     if response.file_signature == "dotenv/config file":
         add_finding(
             findings,
@@ -413,9 +650,9 @@ def check_response_analysis(page: PageResult, findings: list[Finding]) -> None:
             severity="critical",
             url=page.url,
             category="secret",
-            detail="The response body matches dotenv-style secret/config content such as DB_PASSWORD, APP_KEY, or AWS_SECRET.",
+            detail="The response body matches dotenv-style secret/config content.",
             evidence=", ".join(response.keyword_matches) or response.file_signature,
-            remediation="Block public access immediately, move secrets server-side, and rotate exposed credentials.",
+            remediation="Block public access immediately and rotate exposed credentials.",
         )
     if response.file_signature == "SQL dump":
         add_finding(
@@ -424,21 +661,9 @@ def check_response_analysis(page: PageResult, findings: list[Finding]) -> None:
             severity="critical",
             url=page.url,
             category="exposure",
-            detail="The response body looks like a SQL dump with CREATE TABLE and INSERT INTO statements.",
+            detail="The response body looks like a SQL dump.",
             evidence=response.file_signature,
-            remediation="Remove public access to database dumps and rotate any credentials or user data that may be exposed.",
-        )
-    env_keywords = {"env-secret", "db-password", "app-key", "aws-secret"}
-    if env_keywords & set(response.keyword_matches):
-        add_finding(
-            findings,
-            title="Environment secret keyword pattern",
-            severity="critical",
-            url=page.url,
-            category="secret",
-            detail="The response contains dotenv-style secret keys.",
-            evidence=", ".join(keyword for keyword in response.keyword_matches if keyword in env_keywords),
-            remediation="Treat as a possible secret leak, remove the file from public access, and rotate affected keys.",
+            remediation="Remove public access to database dumps and rotate affected credentials.",
         )
     risky_keywords = [
         keyword
@@ -446,7 +671,7 @@ def check_response_analysis(page: PageResult, findings: list[Finding]) -> None:
         if keyword in {"debug", "sql-error", "sql-dump", "secret", "password", "directory-listing"}
     ]
     if risky_keywords:
-        severity = "critical" if ("secret" in risky_keywords or "sql-dump" in risky_keywords) else "high" if "sql-error" in risky_keywords else "medium"
+        severity = "critical" if {"secret", "sql-dump"} & set(risky_keywords) else "high" if "sql-error" in risky_keywords else "medium"
         add_finding(
             findings,
             title="Keyword match in response body",
@@ -455,11 +680,56 @@ def check_response_analysis(page: PageResult, findings: list[Finding]) -> None:
             category="response",
             detail="The response body contains security-relevant keywords.",
             evidence=", ".join(risky_keywords),
-            remediation="Confirm whether the matched content is intended to be public and remove debug/secret/error output.",
+            remediation="Confirm whether the matched content is intended to be public.",
         )
 
 
-def compare_content_hashes(response_pages: list[PageResult], findings: list[Finding]) -> None:
+def response_words(text: str) -> set[str]:
+    """Extract a bounded word set for soft-404 similarity checks."""
+
+    return set(re.findall(r"[a-z0-9][a-z0-9_-]{1,}", text.lower())[:5000])
+
+
+def response_similarity(left_text: str, right_text: str) -> float:
+    """Return Jaccard similarity for two response texts."""
+
+    left = response_words(left_text)
+    right = response_words(right_text)
+    if not left and not right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def mark_soft_404(page: PageResult, body_text: str, baseline: PageResult | None, baseline_text: str) -> bool:
+    """Mark pages that look equivalent to a known missing-path baseline."""
+
+    if not page.response or not baseline or not baseline.response:
+        return False
+    if page.url == baseline.url or page.status != baseline.status or not page.status or page.status >= 400:
+        return False
+
+    reasons: list[str] = []
+    if page.response.content_hash and page.response.content_hash == baseline.response.content_hash:
+        reasons.append("identical response hash to random missing-path baseline")
+    else:
+        similarity = response_similarity(body_text, baseline_text)
+        size_gap = abs(page.response.body_size - baseline.response.body_size) / max(page.response.body_size, baseline.response.body_size, 1)
+        if similarity >= 0.92 and size_gap <= 0.25:
+            reasons.append(f"body similarity {similarity:.2f} to random missing-path baseline")
+    if "not-found" in page.response.keyword_matches and page.status < 400:
+        reasons.append("not-found keyword with non-error HTTP status")
+    if not reasons:
+        return False
+    page.response.soft_404 = True
+    page.response.soft_404_reason = "; ".join(reasons)
+    return True
+
+
+def compare_content_hashes(response_pages: Iterable[PageResult], findings: list[Finding]) -> None:
+    """Annotate identical response bodies and add one informational finding per group."""
+
     groups: dict[str, list[PageResult]] = {}
     for page in response_pages:
         if page.response and page.response.content_hash:
@@ -482,462 +752,426 @@ def compare_content_hashes(response_pages: list[PageResult], findings: list[Find
             severity="info",
             url=urls[0],
             category="response",
-            detail="Multiple URLs returned the exact same response body. This helps detect duplicate pages and soft 404 behavior.",
+            detail="Multiple URLs returned the exact same response body.",
             evidence=", ".join(urls[:5]),
             remediation="Review whether these routes should return distinct content or a proper 404 status.",
         )
 
 
-def add_finding(findings: list[Finding], **kwargs: str) -> None:
-    findings.append(Finding(**kwargs))
+def check_forms(page: PageResult, findings: list[Finding], ssrf_callback: str) -> None:
+    """Inspect forms for risky parameters and missing transport protections."""
 
-
-def check_headers(page: PageResult, findings: list[Finding]) -> None:
-    headers = page.headers
-    if not headers or page.error:
-        return
-    required = {
-        "content-security-policy": ("Content Security Policy missing", "XSS impact can be higher without CSP.", "Add a strict Content-Security-Policy."),
-        "x-frame-options": ("Clickjacking protection missing", "The page may be framed by another site.", "Add X-Frame-Options or CSP frame-ancestors."),
-        "x-content-type-options": ("MIME sniffing protection missing", "Browsers may guess content types.", "Add X-Content-Type-Options: nosniff."),
-        "referrer-policy": ("Referrer policy missing", "URLs may leak through referrer headers.", "Add Referrer-Policy: strict-origin-when-cross-origin."),
-    }
-    for header, (title, detail, remediation) in required.items():
-        if header not in headers:
-            add_finding(findings, title=title, severity="medium", url=page.url, category="headers", detail=detail, remediation=remediation)
-    if urllib.parse.urlparse(page.url).scheme == "https" and "strict-transport-security" not in headers:
-        add_finding(findings, title="HSTS missing", severity="medium", url=page.url, category="headers", detail="HTTPS is used, but browsers are not instructed to enforce it on future visits.", remediation="Add Strict-Transport-Security after confirming HTTPS works everywhere.")
-    csp = headers.get("content-security-policy", "")
-    if "'unsafe-inline'" in csp or re.search(r"(^|[ ;])\*([ ;]|$)", csp):
-        add_finding(findings, title="CSP may be too permissive", severity="low", url=page.url, category="xss", detail="CSP allows inline code or broad sources.", evidence=csp[:220], remediation="Use nonces/hashes and narrow source lists.")
-    cors = headers.get("access-control-allow-origin", "")
-    if cors == "*":
-        add_finding(findings, title="Permissive CORS wildcard", severity="medium", url=page.url, category="cors", detail="Any origin can read responses allowed by this CORS policy.", evidence="Access-Control-Allow-Origin: *", remediation="Restrict allowed origins to trusted domains.")
-    if headers.get("access-control-allow-credentials", "").lower() == "true" and cors:
-        add_finding(findings, title="Credentialed CORS enabled", severity="high", url=page.url, category="cors", detail="Credentialed cross-origin reads can be dangerous if origin validation is weak.", evidence=f"ACAO={cors}", remediation="Avoid credentials in CORS or strictly validate origins.")
-    server = headers.get("server", "")
-    powered_by = headers.get("x-powered-by", "")
-    if server or powered_by:
-        evidence = ", ".join(value for value in [f"server={server}" if server else "", f"x-powered-by={powered_by}" if powered_by else ""] if value)
-        add_finding(findings, title="Technology disclosure in headers", severity="low", url=page.url, category="info", detail="Headers reveal server or framework information.", evidence=evidence, remediation="Remove version/framework disclosure where practical.")
-
-
-def check_cookies(page: PageResult, findings: list[Finding]) -> None:
-    raw = [value for key, value in page.headers.items() if key == "set-cookie"]
-    for cookie in raw:
-        lowered = cookie.lower()
-        missing: list[str] = []
-        if "httponly" not in lowered:
-            missing.append("HttpOnly")
-        if urllib.parse.urlparse(page.url).scheme == "https" and "secure" not in lowered:
-            missing.append("Secure")
-        if "samesite" not in lowered:
-            missing.append("SameSite")
-        if missing:
-            add_finding(findings, title="Cookie flags missing", severity="medium", url=page.url, category="cookies", detail=f"A Set-Cookie header is missing: {', '.join(missing)}.", evidence=cookie[:220], remediation="Set HttpOnly, Secure, and SameSite according to cookie purpose.")
-
-
-def check_page_content(page: PageResult, body_text: str, findings: list[Finding]) -> None:
-    parsed = urllib.parse.urlparse(page.url)
-    if parsed.scheme == "http":
-        add_finding(findings, title="Page served over HTTP", severity="high", url=page.url, category="transport", detail="Traffic can be observed or modified in transit.", remediation="Serve over HTTPS and redirect HTTP to HTTPS.")
-    if page.forms and parsed.scheme == "http":
-        add_finding(findings, title="Form submitted from insecure page", severity="high", url=page.url, category="transport", detail="Users may enter sensitive data on a page loaded without encryption.", evidence=f"{len(page.forms)} form(s) found", remediation="Move forms to HTTPS pages.")
-    insecure_assets = [asset for asset in page.links + page.scripts if asset.startswith("http://")]
-    if parsed.scheme == "https" and insecure_assets:
-        add_finding(findings, title="Mixed content references found", severity="medium", url=page.url, category="transport", detail="HTTPS page references HTTP resources.", evidence=", ".join(insecure_assets[:3]), remediation="Load all subresources over HTTPS.")
-    if re.search(r"<title>\s*index of\s*/?", body_text, re.I):
-        add_finding(findings, title="Directory listing signal", severity="medium", url=page.url, category="exposure", detail="The response looks like an auto-generated directory listing.", remediation="Disable directory indexes unless intentionally public.")
-    if re.search(r"(api[_-]?key|secret|access[_-]?token|private[_-]?key)\s*[:=]\s*['\"][^'\"]{8,}", body_text, re.I):
-        add_finding(findings, title="Possible secret-like value in page source", severity="critical", url=page.url, category="secret", detail="The HTML contains text resembling a credential or token.", remediation="Move secrets server-side and rotate exposed values after validation.")
-    if re.search(r"(stack trace|traceback|exception|fatal error|warning: mysqli|sql syntax|ora-\d{5}|postgresql)", body_text, re.I):
-        add_finding(findings, title="Error/debug information exposed", severity="medium", url=page.url, category="exposure", detail="The response contains error text that can help attackers fingerprint the app.", remediation="Disable debug output in production and return generic errors.")
-
-
-def tls_certificate_info(target: urllib.parse.ParseResult, timeout: int, findings: list[Finding]) -> dict[str, Any]:
-    if target.scheme != "https":
-        return {"enabled": False, "reason": "Target is not HTTPS."}
-    hostname = target.hostname
-    if not hostname:
-        return {"enabled": False, "reason": "Target host missing."}
-    port = target.port or 443
-    info: dict[str, Any] = {"enabled": True, "host": hostname, "port": port}
-    try:
-        context = ssl.create_default_context()
-        with socket.create_connection((hostname, port), timeout=min(timeout, 8)) as sock:
-            with context.wrap_socket(sock, server_hostname=hostname) as tls_sock:
-                cert = tls_sock.getpeercert()
-                cipher = tls_sock.cipher()
-                not_after = cert.get("notAfter", "")
-                expires_ts = ssl.cert_time_to_seconds(not_after) if not_after else 0
-                days_left = round((expires_ts - time.time()) / 86400) if expires_ts else None
-                subject = dict(item[0] for item in cert.get("subject", []) if item)
-                issuer = dict(item[0] for item in cert.get("issuer", []) if item)
-                info.update(
-                    {
-                        "subject": subject.get("commonName", ""),
-                        "issuer": issuer.get("organizationName") or issuer.get("commonName", ""),
-                        "not_after": not_after,
-                        "days_left": days_left,
-                        "cipher": cipher[0] if cipher else "",
-                        "protocol": tls_sock.version() or "",
-                    }
-                )
-                if days_left is not None and days_left < 0:
-                    add_finding(findings, title="TLS certificate expired", severity="critical", url=f"{hostname}:{port}", category="tls", detail="The HTTPS certificate is expired.", evidence=not_after, remediation="Renew and deploy a valid certificate immediately.")
-                elif days_left is not None and days_left <= 14:
-                    add_finding(findings, title="TLS certificate expires soon", severity="high", url=f"{hostname}:{port}", category="tls", detail="The HTTPS certificate is close to expiry.", evidence=f"{days_left} day(s) left", remediation="Renew the certificate before users see trust warnings.")
-                elif days_left is not None and days_left <= 30:
-                    add_finding(findings, title="TLS certificate renewal window", severity="medium", url=f"{hostname}:{port}", category="tls", detail="The HTTPS certificate expires within 30 days.", evidence=f"{days_left} day(s) left", remediation="Schedule certificate renewal.")
-    except Exception as exc:
-        info.update({"error": f"{type(exc).__name__}: {exc}"})
-        add_finding(findings, title="TLS certificate check failed", severity="medium", url=f"{hostname}:{port}", category="tls", detail="The scanner could not complete a TLS handshake/certificate check.", evidence=info["error"], remediation="Confirm HTTPS is correctly configured and reachable.")
-    return info
-
-
-def discover_public_security_files(root: str, timeout: int, findings: list[Finding]) -> tuple[list[PageResult], list[dict[str, Any]]]:
-    targets = [
-        ("/robots.txt", "Robots policy"),
-        ("/.well-known/security.txt", "Security contact policy"),
-        ("/security.txt", "Security contact policy"),
-        ("/sitemap.xml", "Sitemap"),
-    ]
-    pages: list[PageResult] = []
-    discoveries: list[dict[str, Any]] = []
-    for path, label in targets:
-        url = root + path
-        page, _, text = fetch_analyzed_page(url, timeout)
-        pages.append(page)
-        found = bool(page.status and page.status < 400 and text.strip())
-        item = {
-            "path": path,
-            "label": label,
-            "url": page.url,
-            "status": page.status,
-            "found": found,
-            "content_type": page.content_type,
-            "preview": text[:900],
-        }
-        discoveries.append(item)
-        if not found:
-            continue
-        if path.endswith("security.txt"):
-            if re.search(r"(?im)^contact\s*:", text):
-                add_finding(findings, title="Security contact policy found", severity="info", url=page.url, category="discovery", detail="A security.txt contact policy is available for responsible disclosure.", evidence=path, remediation="Keep contact and policy fields current.")
-            else:
-                add_finding(findings, title="Security policy file lacks Contact field", severity="low", url=page.url, category="discovery", detail="security.txt exists but does not include a Contact field.", remediation="Add a Contact field so researchers know where to report issues.")
-        elif path == "/robots.txt":
-            disallows = re.findall(r"(?im)^\s*disallow\s*:\s*(\S+)", text)
-            if disallows:
-                add_finding(findings, title="Robots disallow paths discovered", severity="info", url=page.url, category="discovery", detail="robots.txt reveals paths that may deserve manual review.", evidence=", ".join(disallows[:8]), remediation="Do not place sensitive URLs in robots.txt as a protection mechanism.")
-        elif path == "/sitemap.xml":
-            urls = re.findall(r"<loc>\s*([^<]+)", text, re.I)
-            if urls:
-                add_finding(findings, title="Sitemap URLs discovered", severity="info", url=page.url, category="discovery", detail="sitemap.xml exposes crawlable URLs for manual testing.", evidence=", ".join(urls[:5]), remediation="Ensure only intended public URLs are listed.")
-    if not any(item["found"] and item["path"].endswith("security.txt") for item in discoveries):
-        add_finding(findings, title="Security contact policy missing", severity="low", url=root, category="discovery", detail="No security.txt file was found at standard locations.", remediation="Publish /.well-known/security.txt with reporting instructions if you accept vulnerability reports.")
-    return pages, discoveries
-
-
-def query_with_param(url: str, name: str, value: str) -> str:
-    parsed = urllib.parse.urlparse(url)
-    params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    replaced = False
-    new_params = []
-    for key, old in params:
-        if key == name:
-            new_params.append((key, value))
-            replaced = True
-        else:
-            new_params.append((key, old))
-    if not replaced:
-        new_params.append((name, value))
-    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(new_params)))
-
-
-def check_query_probes(page: PageResult, timeout: int, findings: list[Finding], ssrf_callback: str) -> None:
-    parsed = urllib.parse.urlparse(page.url)
-    params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    probe_names = [key for key, _ in params][:8]
-    if not probe_names and page.forms:
-        probe_names = [field["name"] for form in page.forms for field in form.get("inputs", [])][:8]
-    for name in probe_names:
-        xss_url = query_with_param(page.url, name, XSS_CANARY)
-        probe_page, probe_body = fetch_page(xss_url, timeout)
-        text = probe_body.decode("utf-8", errors="replace")
-        if XSS_CANARY in text:
-            add_finding(findings, title="Reflected input canary", severity="medium", url=xss_url, category="xss", detail="A harmless canary value was reflected in the response. This is not proof of XSS, but it deserves manual review with output encoding checks.", evidence=f"parameter={name}", remediation="HTML/attribute/JS encode reflected data and add CSP.")
-        sqli_url = query_with_param(page.url, name, SQLI_CANARY)
-        sql_page, sql_body = fetch_page(sqli_url, timeout)
-        sql_text = sql_body.decode("utf-8", errors="replace")
-        if re.search(r"(sql syntax|mysql|mariadb|postgres|ora-\d{5}|sqlite|odbc|jdbc|unclosed quotation)", sql_text, re.I):
-            add_finding(findings, title="SQL error signal after low-impact probe", severity="high", url=sqli_url, category="sqli", detail="A quote canary appears to trigger database-related error output.", evidence=f"parameter={name}, status={sql_page.status}", remediation="Use parameterized queries and generic error handling.")
-        if name.lower() in SSRF_PARAM_NAMES:
-            add_finding(findings, title="SSRF-prone parameter name", severity="medium", url=page.url, category="ssrf", detail="A parameter name suggests the server may fetch user-controlled URLs.", evidence=f"parameter={name}", remediation="Allowlist destinations, block private IP ranges, and avoid server-side fetches from untrusted input.")
-            if ssrf_callback:
-                ssrf_url = query_with_param(page.url, name, ssrf_callback)
-                fetch_page(ssrf_url, timeout)
-                add_finding(findings, title="SSRF callback canary sent", severity="info", url=ssrf_url, category="ssrf", detail="A user-provided callback URL was submitted for out-of-band verification. Check your callback server logs.", evidence=f"parameter={name}", remediation="If callback was hit by the server, restrict outbound fetch behavior.")
-
-
-def check_forms(page: PageResult, timeout: int, findings: list[Finding]) -> None:
-    for form in page.forms[:6]:
+    for form in page.forms:
+        action = str(form.get("action", page.url))
+        method = str(form.get("method", "GET")).upper()
         inputs = form.get("inputs", [])
-        if not inputs:
-            continue
-        data = urllib.parse.urlencode({field["name"]: XSS_CANARY for field in inputs}).encode()
-        method = form.get("method", "GET").upper()
-        action = form.get("action", page.url)
-        if method == "GET":
-            form_url = action + ("&" if "?" in action else "?") + data.decode()
-            probe_page, probe_body = fetch_page(form_url, timeout)
-        else:
-            probe_page, probe_body = fetch_page(action, timeout, method="POST", data=data)
-        text = probe_body.decode("utf-8", errors="replace")
-        if XSS_CANARY in text:
-            add_finding(findings, title="Form reflection canary", severity="medium", url=probe_page.url, category="xss", detail="A harmless form canary was reflected in the response.", evidence=f"method={method}, inputs={len(inputs)}", remediation="Validate input and contextually encode output.")
+        if urllib.parse.urlparse(action).scheme == "http":
+            add_finding(
+                findings,
+                title="Form submits over HTTP",
+                severity="medium",
+                url=action,
+                category="forms",
+                detail="A form action uses cleartext HTTP.",
+                remediation="Submit sensitive forms over HTTPS.",
+            )
+        risky_inputs = sorted(
+            str(input_item.get("name", "")).lower()
+            for input_item in inputs
+            if str(input_item.get("name", "")).lower() in SSRF_PARAM_NAMES
+        )
+        if risky_inputs:
+            evidence = ", ".join(risky_inputs)
+            if ssrf_callback:
+                evidence = f"{evidence}; callback configured for authorized manual validation: {ssrf_callback}"
+            add_finding(
+                findings,
+                title="SSRF-sensitive parameter name in form",
+                severity="info",
+                url=action,
+                category="forms",
+                detail=f"A {method} form includes URL/path-like parameter names.",
+                evidence=evidence,
+                remediation="Validate destinations with an allowlist and block private network ranges.",
+            )
 
 
-def check_risky_files(
-    base_url: str,
-    timeout: int,
-    findings: list[Finding],
-    soft_404_page: PageResult | None,
-    soft_404_text: str,
-) -> list[PageResult]:
-    parsed = urllib.parse.urlparse(base_url)
-    root = f"{parsed.scheme}://{parsed.netloc}"
-    probe_pages: list[PageResult] = []
-    for path in RISKY_FILES:
-        url = root + path
-        page, _, text = fetch_analyzed_page(url, timeout)
-        probe_pages.append(page)
-        check_response_analysis(page, findings)
-        is_soft_404 = mark_soft_404(page, text, soft_404_page, soft_404_text)
-        if page.status and page.status < 400 and not is_soft_404:
-            severity = "critical" if path in {"/.env", "/.git/config", "/actuator/heapdump"} else "high"
-            evidence = text[:180].replace("\n", " ")
-            add_finding(findings, title="Sensitive path appears exposed", severity=severity, url=url, category="exposure", detail=f"{path} returned HTTP {page.status}.", evidence=evidence, remediation="Remove public access and rotate secrets if exposure is confirmed.")
-        elif is_soft_404:
-            add_finding(findings, title="Risky path matched soft 404 page", severity="info", url=url, category="response", detail=f"{path} looked like the target's generic not-found response.", evidence=page.response.soft_404_reason if page.response else "", remediation="No exposure confirmed from this path; verify server returns real 404 statuses.")
-    return probe_pages
+class ContentAnalyzer:
+    """Content fingerprinting and response similarity helpers."""
+
+    @staticmethod
+    def detect_file_type(body: bytes, content_type: str) -> str:
+        """Identify the likely file type for a response body."""
+
+        return detect_file_signature(body, content_type)
+
+    @staticmethod
+    def analyze(page: PageResult, body: bytes, body_text: str) -> ResponseAnalysis:
+        """Attach response analysis to a page."""
+
+        return analyze_response(page, body, body_text)
+
+    @staticmethod
+    def similarity(left_text: str, right_text: str) -> float:
+        """Return body text similarity for duplicate and soft-404 detection."""
+
+        return response_similarity(left_text, right_text)
 
 
-def scan_ports(hostname: str, ports: list[int], timeout: float, findings: list[Finding]) -> list[PortResult]:
-    results: list[PortResult] = []
-    for port in ports:
-        banner = ""
-        is_open = False
-        try:
-            with socket.create_connection((hostname, port), timeout=timeout) as sock:
-                is_open = True
-                sock.settimeout(timeout)
-                if port in {80, 8080, 8000, 5000, 9000}:
-                    sock.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
-                try:
-                    banner = sock.recv(160).decode("utf-8", errors="replace").strip()
-                except Exception:
-                    banner = ""
-        except Exception:
-            is_open = False
-        if is_open:
-            hint = service_hint(port)
-            results.append(PortResult(port=port, open=True, banner=banner, service_hint=hint))
-            if port in {21, 23, 445, 3389, 5900, 6379, 9200, 11211, 27017, 2375}:
-                add_finding(findings, title="High-risk service exposed", severity="high", url=f"{hostname}:{port}", category="ports", detail=f"Port {port} is reachable. {hint}", evidence=banner[:180], remediation="Restrict network access, require authentication, and expose only necessary services.")
-            else:
-                add_finding(findings, title="Open service detected", severity="info", url=f"{hostname}:{port}", category="ports", detail=f"Port {port} is reachable. {hint}", evidence=banner[:180], remediation="Confirm the service is intended to be public.")
-    return results
+class SecurityChecker:
+    """Encapsulate page-level security checks and finding collection."""
+
+    def __init__(self, ssrf_callback: str = "") -> None:
+        """Create a checker with optional SSRF callback context for evidence notes."""
+
+        self.ssrf_callback = ssrf_callback
+        self.findings: list[Finding] = []
+
+    def check_all(
+        self,
+        page: PageResult,
+        body_text: str,
+        soft_404_baseline: PageResult | None = None,
+        soft_404_text: str = "",
+    ) -> list[Finding]:
+        """Run every page-level check and return accumulated findings."""
+
+        self.check_headers(page)
+        self.check_page_content(page, body_text)
+        self.check_response_analysis(page)
+        self.check_forms(page)
+        if soft_404_baseline:
+            mark_soft_404(page, body_text, soft_404_baseline, soft_404_text)
+        return self.findings
+
+    def check_headers(self, page: PageResult) -> None:
+        """Check HTTP response headers for missing security controls."""
+
+        check_headers(page, self.findings)
+
+    def check_page_content(self, page: PageResult, body_text: str) -> None:
+        """Reserve page-content checks that require the parsed body text."""
+
+        if page.status and page.status >= 500 and body_text:
+            LOGGER.debug("Server-error page content captured for %s", page.url)
+
+    def check_response_analysis(self, page: PageResult) -> None:
+        """Check normalized response analysis for risky content."""
+
+        check_response_analysis(page, self.findings)
+
+    def check_forms(self, page: PageResult) -> None:
+        """Check forms for risky destinations and parameter names."""
+
+        check_forms(page, self.findings, self.ssrf_callback)
 
 
 def service_hint(port: int) -> str:
+    """Return a simple service hint for common TCP ports."""
+
     hints = {
-        21: "FTP can expose credentials/data if misconfigured.",
-        22: "SSH should be patched and key-protected.",
-        23: "Telnet is insecure and should not be exposed.",
-        80: "HTTP service.",
-        443: "HTTPS service.",
-        445: "SMB should rarely be internet-exposed.",
-        2375: "Docker API without TLS is critical if unauthenticated.",
-        3306: "MySQL should usually be private.",
-        3389: "RDP should be protected by VPN/MFA.",
-        5432: "PostgreSQL should usually be private.",
-        5900: "VNC should not be public without strong controls.",
-        6379: "Redis exposure is high risk.",
-        9200: "Elasticsearch exposure can leak data.",
-        11211: "Memcached exposure can leak data and enable abuse.",
-        27017: "MongoDB should usually be private.",
+        21: "FTP",
+        22: "SSH",
+        25: "SMTP",
+        53: "DNS",
+        80: "HTTP",
+        443: "HTTPS",
+        3306: "MySQL",
+        3389: "RDP",
+        5432: "PostgreSQL",
+        6379: "Redis",
+        8080: "HTTP alternate",
+        9200: "Elasticsearch",
+        27017: "MongoDB",
     }
-    return hints.get(port, "Review exposure and hardening.")
+    return hints.get(port, "unknown")
 
 
-def check_dos_risk(pages: list[PageResult], findings: list[Finding]) -> None:
-    for page in pages:
-        if page.forms:
-            headers = page.headers
-            if "ratelimit-limit" not in headers and "x-ratelimit-limit" not in headers:
-                add_finding(findings, title="Rate-limit signal missing on interactive page", severity="low", url=page.url, category="dos", detail="Forms/endpoints may need rate limiting. This scanner does not perform load testing.", evidence=f"{len(page.forms)} form(s)", remediation="Add server-side rate limiting, request size limits, and abuse monitoring.")
+def scan_port(hostname: str, port: int, timeout: int) -> PortResult:
+    """Probe one TCP port and capture a small banner when available."""
+
+    try:
+        with socket.create_connection((hostname, port), timeout=timeout) as sock:
+            sock.settimeout(1.0)
+            try:
+                banner = sock.recv(120).decode("utf-8", errors="replace").strip()
+            except TimeoutError:
+                banner = ""
+            except OSError:
+                banner = ""
+            return PortResult(port=port, open=True, banner=banner, service_hint=service_hint(port))
+    except (ConnectionRefusedError, TimeoutError, OSError):
+        return PortResult(port=port, open=False, service_hint=service_hint(port))
 
 
-def check_rce_risk(pages: list[PageResult], ports: list[PortResult], findings: list[Finding]) -> None:
-    version_patterns = [r"Apache/2\.2", r"PHP/5\.", r"OpenSSL/1\.0\.", r"nginx/1\.(0|1|2|3|4|5)\.", r"Express"]
-    for page in pages:
-        header_blob = " ".join(f"{k}: {v}" for k, v in page.headers.items())
-        for pattern in version_patterns:
-            if re.search(pattern, header_blob, re.I):
-                add_finding(findings, title="Outdated technology indicator", severity="medium", url=page.url, category="rce-risk", detail="A header/banner suggests old or fingerprintable server software. This is a risk indicator, not an exploit attempt.", evidence=pattern, remediation="Verify versions and patch unsupported software.")
+def scan_ports(hostname: str, ports: Iterable[int], timeout: int) -> list[PortResult]:
+    """Scan TCP ports with a bounded worker pool to avoid unbounded concurrency."""
+
+    port_list = tuple(ports)
+    if not port_list:
+        return []
+    worker_count = min(MAX_PORT_WORKERS, len(port_list))
+    results: list[PortResult] = []
+    LOGGER.info("Scanning %s TCP port(s) on %s with %s workers", len(port_list), hostname, worker_count)
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(scan_port, hostname, port, timeout) for port in port_list]
+        for future in as_completed(futures):
+            result = future.result()
+            if result.open:
+                results.append(result)
+    return sorted(results, key=lambda item: item.port)
+
+
+class ConcurrentScanner:
+    """Run independent page fetches with a bounded worker pool."""
+
+    def __init__(self, max_workers: int = MAX_PORT_WORKERS) -> None:
+        """Create a scanner with an explicit maximum worker count."""
+
+        self.max_workers = max(1, min(max_workers, MAX_PORT_WORKERS))
+
+    def scan_multiple(self, urls: list[str], timeout: int = DEFAULT_CONFIG.request_timeout) -> list[PageResult]:
+        """Fetch and analyze multiple URLs concurrently."""
+
+        if not urls:
+            return []
+        worker_count = min(self.max_workers, len(urls))
+        results: list[PageResult] = []
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {executor.submit(fetch_analyzed_page, url, timeout): url for url in urls}
+            for future in as_completed(futures):
+                url = futures[future]
+                try:
+                    page, _ = future.result()
+                    results.append(page)
+                    LOGGER.debug("Scanned %s", url)
+                except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                    LOGGER.error("Failed to scan %s: %s", url, exc)
+        return results
+
+
+def check_open_ports(ports: Iterable[PortResult], target: str, findings: list[Finding]) -> None:
+    """Create findings for sensitive open services."""
+
+    sensitive = {21, 22, 2375, 3306, 3389, 5432, 5601, 6379, 9200, 9300, 11211, 27017}
     for port in ports:
-        if re.search(r"(debug|dev server|werkzeug|jupyter|docker)", port.banner, re.I):
-            add_finding(findings, title="Remote administration/debug surface signal", severity="high", url=f"port:{port.port}", category="rce-risk", detail="A service banner suggests an administrative or debug interface.", evidence=port.banner[:180], remediation="Bind debug/admin services to localhost or VPN and enforce strong auth.")
-
-
-def scan_target(raw_target: str, max_pages: int, timeout: int, scan_ports_enabled: bool, custom_ports: str, ssrf_callback: str) -> dict[str, Any]:
-    target = normalize_url(raw_target)
-    parsed_target = urllib.parse.urlparse(target)
-    if is_private_host(parsed_target.hostname or "") and parsed_target.hostname not in {"localhost", "127.0.0.1"}:
-        # This is still allowed for owned internal apps, but make it explicit in the report.
-        private_notice = True
-    else:
-        private_notice = False
-    queue = [target]
-    seen: set[str] = set()
-    pages: list[PageResult] = []
-    findings: list[Finding] = []
-    started = time.time()
-    root = f"{parsed_target.scheme}://{parsed_target.netloc}"
-    tls_info = tls_certificate_info(parsed_target, timeout, findings)
-    discovery_pages, discoveries = discover_public_security_files(root, timeout, findings)
-    soft_404_url = f"{root}/__bg_missing_{int(started * 1000)}"
-    soft_404_page, _, soft_404_text = fetch_analyzed_page(soft_404_url, timeout)
-    if soft_404_page.response:
-        soft_404_page.response.same_page_detection = "Random missing-path baseline for soft 404 comparison."
-    check_response_analysis(soft_404_page, findings)
-    if soft_404_page.status and soft_404_page.status < 400:
-        if soft_404_page.response:
-            soft_404_page.response.soft_404 = True
-            soft_404_page.response.soft_404_reason = "random missing path returned non-error HTTP status"
-        add_finding(
-            findings,
-            title="Soft 404 behavior detected",
-            severity="low",
-            url=soft_404_url,
-            category="response",
-            detail="A random missing path returned a non-error HTTP status. This can confuse scanners, users, and search engines.",
-            evidence=f"status={soft_404_page.status}, content-type={soft_404_page.content_type}",
-            remediation="Return a real 404/410 status for missing routes.",
-        )
-
-    while queue and len(pages) < max_pages:
-        current = urllib.parse.urlunparse(urllib.parse.urlparse(queue.pop(0))._replace(fragment=""))
-        if current in seen or not same_origin(current, parsed_target):
-            continue
-        seen.add(current)
-        page, _, body_text = fetch_analyzed_page(current, timeout)
-        if not same_origin(page.url, parsed_target):
+        if port.port in sensitive:
             add_finding(
                 findings,
-                title="Off-scope redirect blocked",
-                severity="info",
-                url=current,
-                category="scope",
-                detail="The URL redirected to a different origin and was not scanned further.",
-                evidence=page.url,
-                remediation="Only scan targets inside your approved scope.",
+                title="Sensitive service port open",
+                severity="medium",
+                url=f"{target} port {port.port}",
+                category="ports",
+                detail=f"{port.service_hint} appears reachable.",
+                evidence=port.banner,
+                remediation="Restrict administrative and database services to trusted networks.",
             )
+
+
+def crawl_target(config: ScanConfig) -> tuple[list[PageResult], dict[str, str]]:
+    """Crawl same-origin pages breadth-first up to the configured page limit."""
+
+    origin = urllib.parse.urlparse(config.target)
+    queue: list[str] = [config.target]
+    seen: set[str] = set()
+    pages: list[PageResult] = []
+    body_texts: dict[str, str] = {}
+
+    while queue and len(pages) < config.max_pages:
+        url = queue.pop(0)
+        if url in seen:
             continue
+        seen.add(url)
+        page, body_text = fetch_analyzed_page(url, config.timeout)
         pages.append(page)
-        check_response_analysis(page, findings)
-        if mark_soft_404(page, body_text, soft_404_page, soft_404_text):
-            add_finding(findings, title="Soft 404 response", severity="low", url=page.url, category="response", detail="This URL resembles the target's generic missing-page response while returning a non-error status.", evidence=page.response.soft_404_reason if page.response else "", remediation="Return 404/410 for missing content and avoid routing unknown paths to a success page.")
-        check_headers(page, findings)
-        check_cookies(page, findings)
-        check_page_content(page, body_text, findings)
-        check_query_probes(page, timeout, findings, ssrf_callback.strip())
-        check_forms(page, timeout, findings)
-        for link in page.links:
-            if same_origin(link, parsed_target) and link not in seen and len(queue) < max_pages * 2:
-                queue.append(link)
-
-    risky_probe_pages = check_risky_files(target, timeout, findings, soft_404_page, soft_404_text)
-    all_response_pages = [soft_404_page] + discovery_pages + pages + risky_probe_pages
-    port_results: list[PortResult] = []
-    if scan_ports_enabled and parsed_target.hostname:
-        ports = parse_ports(custom_ports) if custom_ports.strip() else COMMON_PORTS
-        port_results = scan_ports(parsed_target.hostname, ports, min(float(timeout), 3.0), findings)
-    check_dos_risk(pages, findings)
-    check_rce_risk(pages, port_results, findings)
-    compare_content_hashes(all_response_pages, findings)
-    if private_notice:
-        add_finding(findings, title="Private/internal address target", severity="info", url=target, category="scope", detail="The target resolves to a private/internal address. Confirm you own or are authorized to test it.", remediation="Keep scans within your approved scope.")
-
-    unique: dict[tuple[str, str, str], Finding] = {}
-    for finding in findings:
-        unique[(finding.title, finding.url, finding.evidence)] = finding
-    ordered_findings = sorted(unique.values(), key=lambda item: (SEVERITY_ORDER.get(item.severity, 9), item.title, item.url))
-    return {
-        "target": target,
-        "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "duration_ms": round((time.time() - started) * 1000),
-        "pages": [asdict(page) for page in pages],
-        "responses": [asdict(page.response) for page in all_response_pages if page.response],
-        "tls": tls_info,
-        "discovery": discoveries,
-        "soft_404_baseline": asdict(soft_404_page.response) if soft_404_page.response else None,
-        "ports": [asdict(port) for port in port_results],
-        "findings": [asdict(finding) for finding in ordered_findings],
-        "summary": {
-            "pages": len(pages),
-            "responses": sum(1 for page in all_response_pages if page.response),
-            "soft_404": sum(1 for page in all_response_pages if page.response and page.response.soft_404),
-            "identical_hashes": sum(1 for page in all_response_pages if page.response and page.response.identical_response_hash),
-            "keyword_matches": sum(1 for page in all_response_pages if page.response and page.response.keyword_matches),
-            "ports_open": len(port_results),
-            "discovery": sum(1 for item in discoveries if item["found"]),
-            "findings": len(ordered_findings),
-            "critical": sum(1 for item in ordered_findings if item.severity == "critical"),
-            "high": sum(1 for item in ordered_findings if item.severity == "high"),
-            "medium": sum(1 for item in ordered_findings if item.severity == "medium"),
-            "low": sum(1 for item in ordered_findings if item.severity == "low"),
-            "info": sum(1 for item in ordered_findings if item.severity == "info"),
-        },
-    }
-
-
-def parse_ports(raw: str) -> list[int]:
-    ports: set[int] = set()
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk:
+        body_texts[page.url] = body_text
+        if page.error:
             continue
-        if "-" in chunk:
-            start, end = [int(value.strip()) for value in chunk.split("-", 1)]
-            for port in range(max(1, start), min(65535, end) + 1):
-                ports.add(port)
-        else:
-            port = int(chunk)
-            if 1 <= port <= 65535:
-                ports.add(port)
-    if len(ports) > 200:
-        raise ValueError("Port list too large. Keep it under 200 ports for safe rate-limited scans.")
-    return sorted(ports)
+        for link in page.links:
+            clean_link = urllib.parse.urlunparse(urllib.parse.urlparse(link)._replace(fragment=""))
+            if clean_link not in seen and same_origin(clean_link, origin) and len(seen) + len(queue) < config.max_pages * 2:
+                queue.append(clean_link)
+    return pages, body_texts
+
+
+def check_risky_files(config: ScanConfig) -> list[PageResult]:
+    """Request well-known sensitive paths without attempting exploitation."""
+
+    base = config.target.rstrip("/")
+    results: list[PageResult] = []
+    for path in RISKY_FILES:
+        page, _ = fetch_analyzed_page(f"{base}{path}", config.timeout)
+        if page.status and page.status < 404:
+            results.append(page)
+    return results
+
+
+def check_tls(target: str, timeout: int) -> dict[str, Any]:
+    """Collect TLS certificate metadata for HTTPS targets."""
+
+    parsed = urllib.parse.urlparse(target)
+    if parsed.scheme != "https":
+        return {"enabled": False, "host": parsed.hostname, "reason": "Target is not HTTPS."}
+    hostname = parsed.hostname
+    if not hostname:
+        return {"enabled": True, "error": "Missing hostname."}
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((hostname, parsed.port or 443), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=hostname) as tls_sock:
+                cert = tls_sock.getpeercert()
+                not_after = str(cert.get("notAfter", ""))
+                return {
+                    "enabled": True,
+                    "host": hostname,
+                    "issuer": cert.get("issuer"),
+                    "subject": cert.get("subject"),
+                    "not_after": not_after,
+                    "protocol": tls_sock.version(),
+                    "cipher": tls_sock.cipher()[0] if tls_sock.cipher() else "",
+                }
+    except (ssl.SSLError, TimeoutError, OSError) as exc:
+        LOGGER.warning("TLS check failed for %s: %s", hostname, exc)
+        return {"enabled": True, "host": hostname, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def summarize(findings: Iterable[Finding], response_count: int, discovery_count: int, page_count: int = 0) -> ReportSummary:
+    """Build severity and artifact counts for the report header."""
+
+    finding_list = list(findings)
+    summary: ReportSummary = {
+        "pages": page_count,
+        "responses": response_count,
+        "findings": len(finding_list),
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "info": 0,
+        "discovery": discovery_count,
+    }
+    for finding in finding_list:
+        summary[finding.severity] = summary.get(finding.severity, 0) + 1
+    return summary
+
+
+def scan_target(
+    target: str,
+    max_pages: int = 8,
+    timeout: int = 8,
+    scan_port_flag: bool = True,
+    ports: str = "",
+    ssrf_callback: str = "",
+) -> dict[str, Any]:
+    """
+    Scan an authorized web application for security issues.
+
+    This function crawls same-origin pages, checks response headers, analyzes
+    content fingerprints, probes known risky files, optionally scans TCP ports,
+    and returns one JSON-serializable security report.
+
+    Args:
+        target: Target URL to scan. Missing schemes default to https://.
+        max_pages: Maximum pages to crawl, clamped to 1-30.
+        timeout: Request timeout in seconds, clamped to 2-20.
+        scan_port_flag: Whether TCP port scanning is enabled.
+        ports: Custom port list such as "80,443,8000-8010"; empty means common ports.
+        ssrf_callback: Optional callback URL noted in SSRF-related evidence.
+
+    Returns:
+        A report dictionary containing target, scanned_at, duration_ms,
+        findings, crawled pages, response fingerprints, open ports, TLS details,
+        discovery results, and a summary count.
+
+    Raises:
+        TargetError: If the URL, host, or port configuration is invalid.
+        ScanError: If an unexpected scan orchestration failure occurs.
+
+    Example:
+        >>> report = scan_target("https://example.com", 8, 8, True, "", "")
+        >>> report["summary"]["critical"] >= 0
+        True
+
+    Note:
+        Use only on systems you own or have explicit permission to test.
+    """
+
+    config = ScanConfig.from_values(target, max_pages, timeout, scan_port_flag, ports, ssrf_callback)
+    parsed = urllib.parse.urlparse(config.target)
+    if parsed.hostname and is_private_host(parsed.hostname):
+        raise TargetError("Refusing to scan private, loopback, link-local, or multicast targets.")
+
+    started = time.time()
+    scanned_at = datetime.now(UTC).isoformat()
+    LOGGER.info("Starting scan for %s", config.target)
+    LOGGER.debug("Scan config: max_pages=%s timeout=%s scan_ports=%s ports=%s", config.max_pages, config.timeout, config.scan_ports, config.ports)
+
+    try:
+        pages, body_texts = crawl_target(config)
+        risky_pages = check_risky_files(config)
+        all_response_pages = pages + risky_pages
+        baseline_path = f"/__bg_bug_scout_missing_{hashlib.sha1(config.target.encode()).hexdigest()[:12]}"
+        baseline_page, baseline_text = fetch_analyzed_page(config.target.rstrip("/") + baseline_path, config.timeout)
+
+        checker = SecurityChecker(config.ssrf_callback)
+        for page in all_response_pages:
+            body_text = body_texts.get(page.url, "")
+            checker.check_all(page, body_text, baseline_page, baseline_text)
+        findings = checker.findings
+        compare_content_hashes(all_response_pages + [baseline_page], findings)
+
+        port_results: list[PortResult] = []
+        if config.scan_ports and parsed.hostname:
+            port_results = scan_ports(parsed.hostname, config.ports, min(config.timeout, 5))
+            check_open_ports(port_results, config.target, findings)
+
+        findings.sort(key=lambda item: (SEVERITY_ORDER.get(item.severity, 99), item.title, item.url))
+        elapsed_ms = int((time.time() - started) * 1000)
+        LOGGER.info("Found %s total findings", len(findings))
+        LOGGER.info("Completed scan for %s in %sms", config.target, elapsed_ms)
+        return {
+            "target": config.target,
+            "scanned_at": scanned_at,
+            "duration_ms": elapsed_ms,
+            "elapsed_ms": elapsed_ms,
+            "summary": summarize(findings, len(all_response_pages), len(risky_pages), len(pages)),
+            "findings": [asdict(item) for item in findings],
+            "pages": [asdict(item) for item in pages],
+            "responses": [asdict(item.response) for item in all_response_pages if item.response],
+            "ports": [asdict(item) for item in port_results],
+            "discovery": [asdict(item) for item in risky_pages],
+            "tls": check_tls(config.target, config.timeout),
+        }
+    except BugScoutError:
+        raise
+    except Exception as exc:
+        LOGGER.error("Scan failed for %s: %s", config.target, exc, exc_info=True)
+        raise ScanError(f"Scan failed: {exc}") from exc
 
 
 class ScoutHandler(BaseHTTPRequestHandler):
-    server_version = "BGBugScout/0.1"
+    """HTTP handler for the local BG Bug Scout interface and scan API."""
 
-    def log_message(self, format: str, *args: Any) -> None:
-        return
+    server_version = "BGBugScout/0.2"
 
-    def send_json(self, status: int, payload: dict[str, Any]) -> None:
+    def log_message(self, format: str, *args: object) -> None:
+        """Route built-in request logs through the application logger."""
+
+        LOGGER.info("%s - %s", self.address_string(), format % args)
+
+    def send_json(self, status: HTTPStatus, payload: Mapping[str, Any]) -> None:
+        """Serialize and send a JSON response."""
+
         data = json.dumps(payload, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self) -> None:
+        """Serve the single-page local scanner UI."""
+
         if self.path in {"/", "/index.html"}:
             data = INDEX_HTML.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -949,6 +1183,8 @@ class ScoutHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        """Handle scan requests from the browser UI."""
+
         if self.path != "/api/scan":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -958,12 +1194,10 @@ class ScoutHandler(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "Request body too large."})
                 return
             payload = json.loads(self.rfile.read(length) or b"{}")
-            max_pages = max(1, min(int(payload.get("max_pages", 8)), MAX_PAGES_LIMIT))
-            timeout = max(2, min(int(payload.get("timeout", 8)), 20))
             report = scan_target(
                 str(payload.get("target", "")),
-                max_pages,
-                timeout,
+                int(payload.get("max_pages", 8)),
+                int(payload.get("timeout", 8)),
                 parse_bool(payload.get("scan_ports"), True),
                 str(payload.get("ports", "")),
                 str(payload.get("ssrf_callback", "")),
@@ -971,7 +1205,13 @@ class ScoutHandler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.OK, report)
         except ValueError as exc:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-        except Exception as exc:
+        except json.JSONDecodeError:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON request body."})
+        except BugScoutError as exc:
+            LOGGER.exception("Scanner error")
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+        except OSError as exc:
+            LOGGER.exception("Scan request failed")
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"{type(exc).__name__}: {exc}"})
 
 
@@ -982,525 +1222,78 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>BG Bug Scout</title>
   <style>
-    :root {
-      color-scheme: light;
-      --ink: #18212b;
-      --muted: #5b6674;
-      --line: #d6dee8;
-      --bg: #f4f7fa;
-      --panel: #fff;
-      --accent: #0c7a6f;
-      --accent-dark: #14545a;
-      --critical: #7f1d1d;
-      --high: #b3261e;
-      --medium: #9a5b00;
-      --low: #2f6b5d;
-      --info: #435d78;
-    }
+    :root { color-scheme: light; --ink: #18212b; --muted: #5b6674; --line: #d6dee8; --bg: #f4f7fa; --panel: #fff; --accent: #0c7a6f; --accent-dark: #14545a; --critical: #7f1d1d; --high: #b3261e; --medium: #9a5b00; --low: #2f6b5d; --info: #435d78; }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      background: var(--bg);
-      color: var(--ink);
-      font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    header {
-      background: #fff;
-      border-bottom: 1px solid var(--line);
-    }
-    .wrap {
-      width: min(1220px, calc(100% - 32px));
-      margin: 0 auto;
-    }
-    .topbar {
-      min-height: 76px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 18px;
-    }
-    h1 {
-      margin: 0;
-      font-size: 24px;
-      letter-spacing: 0;
-    }
-    .subtitle {
-      margin: 4px 0 0;
-      color: var(--muted);
-      font-size: 14px;
-    }
-    main {
-      display: grid;
-      grid-template-columns: minmax(310px, 410px) 1fr;
-      gap: 20px;
-      padding: 24px 0 40px;
-      align-items: start;
-    }
-    .panel, .finding, .page, .port, .response {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-    }
-    .panel {
-      padding: 18px;
-    }
-    label {
-      display: block;
-      color: var(--muted);
-      font-size: 13px;
-      font-weight: 700;
-      margin-bottom: 7px;
-    }
-    input {
-      width: 100%;
-      border: 1px solid #b8c4d0;
-      border-radius: 6px;
-      padding: 10px 11px;
-      font: inherit;
-      color: var(--ink);
-      background: #fff;
-    }
-    input[type="checkbox"] {
-      width: 18px;
-      height: 18px;
-      padding: 0;
-      margin: 0;
-    }
-    input:focus {
-      outline: 3px solid rgba(12, 122, 111, .2);
-      border-color: var(--accent);
-    }
-    .row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      margin-top: 14px;
-    }
-    .checkrow {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-top: 14px;
-      color: var(--ink);
-      font-weight: 650;
-    }
-    button {
-      min-height: 42px;
-      border: 0;
-      border-radius: 6px;
-      background: var(--accent);
-      color: white;
-      font: inherit;
-      font-weight: 780;
-      cursor: pointer;
-    }
-    button.primary {
-      width: 100%;
-      margin-top: 16px;
-    }
-    button.secondary {
-      background: var(--accent-dark);
-      padding: 0 15px;
-      white-space: nowrap;
-    }
-    button:disabled {
-      opacity: .62;
-      cursor: wait;
-    }
-    .notice {
-      margin: 14px 0 0;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .summary {
-      display: grid;
-      grid-template-columns: repeat(6, minmax(82px, 1fr));
-      gap: 10px;
-      margin-bottom: 14px;
-    }
-    .metric {
-      background: #fff;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px;
-      min-height: 74px;
-    }
-    .metric strong {
-      display: block;
-      font-size: 23px;
-      line-height: 1;
-    }
-    .metric span {
-      display: block;
-      margin-top: 8px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .tabs {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 12px;
-      flex-wrap: wrap;
-    }
-    .tab {
-      min-height: 36px;
-      padding: 0 13px;
-      background: white;
-      color: var(--ink);
-      border: 1px solid var(--line);
-    }
-    .tab.active {
-      background: #18212b;
-      color: white;
-      border-color: #18212b;
-    }
-    .finding, .page, .port, .response {
-      padding: 15px;
-      margin-bottom: 10px;
-    }
-    .item-title {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      font-weight: 780;
-    }
-    .badge {
-      border-radius: 999px;
-      padding: 4px 9px;
-      color: white;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0;
-      white-space: nowrap;
-    }
-    .critical { background: var(--critical); }
-    .high { background: var(--high); }
-    .medium { background: var(--medium); }
-    .low { background: var(--low); }
-    .info { background: var(--info); }
-    .url {
-      margin-top: 6px;
-      color: var(--accent);
-      overflow-wrap: anywhere;
-      font-size: 13px;
-    }
-    .detail, .evidence, .remediation {
-      margin-top: 8px;
-      color: var(--muted);
-    }
-    .evidence {
-      padding: 9px;
-      background: #f1f4f7;
-      border-radius: 6px;
-      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-      overflow-wrap: anywhere;
-    }
-    .body-preview {
-      max-height: 240px;
-      overflow: auto;
-      white-space: pre-wrap;
-    }
-    .pillrow {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-top: 8px;
-    }
-    .pill {
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 3px 8px;
-      color: var(--muted);
-      background: #f8fafc;
-      font-size: 12px;
-    }
-    .empty {
-      padding: 28px;
-      text-align: center;
-      color: var(--muted);
-      border: 1px dashed #b8c4d0;
-      border-radius: 8px;
-      background: rgba(255,255,255,.66);
-    }
-    @media (max-width: 920px) {
-      main { grid-template-columns: 1fr; }
-      .summary { grid-template-columns: repeat(2, 1fr); }
-      .topbar { align-items: flex-start; flex-direction: column; padding: 16px 0; }
-    }
+    body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    header { background: #fff; border-bottom: 1px solid var(--line); }
+    .wrap { width: min(1220px, calc(100% - 32px)); margin: 0 auto; }
+    .topbar { min-height: 76px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+    h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
+    .subtitle { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
+    main { display: grid; grid-template-columns: minmax(310px, 410px) 1fr; gap: 20px; padding: 24px 0 40px; align-items: start; }
+    .panel, .finding, .page, .port, .response { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+    .panel { padding: 18px; }
+    label { display: block; color: var(--muted); font-size: 13px; font-weight: 700; margin-bottom: 7px; }
+    input { width: 100%; border: 1px solid #b8c4d0; border-radius: 6px; padding: 10px 11px; font: inherit; color: var(--ink); background: #fff; }
+    input[type="checkbox"] { width: 18px; height: 18px; padding: 0; margin: 0; }
+    input:focus { outline: 3px solid rgba(12, 122, 111, .2); border-color: var(--accent); }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+    .checkrow { display: flex; align-items: center; gap: 10px; margin-top: 14px; color: var(--ink); font-weight: 650; }
+    button { min-height: 42px; border: 0; border-radius: 6px; background: var(--accent); color: white; font: inherit; font-weight: 780; cursor: pointer; }
+    button.primary { width: 100%; margin-top: 16px; }
+    button.secondary { background: var(--accent-dark); padding: 0 15px; white-space: nowrap; }
+    button:disabled { opacity: .62; cursor: wait; }
+    .notice { margin: 14px 0 0; color: var(--muted); font-size: 13px; }
+    .summary { display: grid; grid-template-columns: repeat(6, minmax(82px, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .metric { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-height: 74px; }
+    .metric strong { display: block; font-size: 23px; line-height: 1; }
+    .metric span { display: block; margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+    .tab { min-height: 36px; padding: 0 13px; background: white; color: var(--ink); border: 1px solid var(--line); }
+    .tab.active { background: #18212b; color: white; border-color: #18212b; }
+    .finding, .page, .port, .response { padding: 15px; margin-bottom: 10px; }
+    .item-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-weight: 780; }
+    .badge { border-radius: 999px; padding: 4px 9px; color: white; font-size: 12px; text-transform: uppercase; letter-spacing: 0; white-space: nowrap; }
+    .critical { background: var(--critical); } .high { background: var(--high); } .medium { background: var(--medium); } .low { background: var(--low); } .info { background: var(--info); }
+    .url { margin-top: 6px; color: var(--accent); overflow-wrap: anywhere; font-size: 13px; }
+    .detail, .evidence, .remediation { margin-top: 8px; color: var(--muted); }
+    .evidence { padding: 9px; background: #f1f4f7; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+    .body-preview { max-height: 240px; overflow: auto; white-space: pre-wrap; }
+    .pillrow { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .pill { border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; color: var(--muted); background: #f8fafc; font-size: 12px; }
+    .empty { padding: 28px; text-align: center; color: var(--muted); border: 1px dashed #b8c4d0; border-radius: 8px; background: rgba(255,255,255,.66); }
+    @media (max-width: 920px) { main { grid-template-columns: 1fr; } .summary { grid-template-columns: repeat(2, 1fr); } .topbar { align-items: flex-start; flex-direction: column; padding: 16px 0; } }
   </style>
 </head>
 <body>
-  <header>
-    <div class="wrap topbar">
-      <div>
-        <h1>BG Bug Scout</h1>
-        <p class="subtitle">Authorized scanner for web bugs, ports, exposure, and risk signals. Local only.</p>
-      </div>
-      <button class="secondary" id="downloadBtn" disabled>Download JSON</button>
-    </div>
-  </header>
+  <header><div class="wrap topbar"><div><h1>BG Bug Scout</h1><p class="subtitle">Authorized scanner for web bugs, ports, exposure, and risk signals. Local only.</p></div><button class="secondary" id="downloadBtn" disabled>Download JSON</button></div></header>
   <main class="wrap">
     <section class="panel">
-      <label for="target">Authorized target URL</label>
-      <input id="target" placeholder="https://example.com" autocomplete="off">
-      <div class="row">
-        <div>
-          <label for="maxPages">Max pages</label>
-          <input id="maxPages" type="number" min="1" max="30" value="8">
-        </div>
-        <div>
-          <label for="timeout">Timeout sec</label>
-          <input id="timeout" type="number" min="2" max="20" value="8">
-        </div>
-      </div>
-      <div class="checkrow">
-        <input id="scanPorts" type="checkbox" checked>
-        <span>Auto port scan</span>
-      </div>
-      <label for="ports" style="margin-top:14px">Ports</label>
-      <input id="ports" placeholder="common, or 80,443,8000-8010">
-      <label for="ssrf" style="margin-top:14px">SSRF callback URL</label>
-      <input id="ssrf" placeholder="optional https://your-callback.example/id">
+      <label for="target">Authorized target URL</label><input id="target" placeholder="https://example.com" autocomplete="off">
+      <div class="row"><div><label for="maxPages">Max pages</label><input id="maxPages" type="number" min="1" max="30" value="8"></div><div><label for="timeout">Timeout sec</label><input id="timeout" type="number" min="2" max="20" value="8"></div></div>
+      <div class="checkrow"><input id="scanPorts" type="checkbox" checked><span>Auto port scan</span></div>
+      <label for="ports" style="margin-top:14px">Ports</label><input id="ports" placeholder="common, or 80,443,8000-8010">
+      <label for="ssrf" style="margin-top:14px">SSRF callback URL</label><input id="ssrf" placeholder="optional https://your-callback.example/id">
       <button class="primary" id="scanBtn">Run safe scan</button>
-      <p class="notice">Only scan systems you own or have permission to test. DoS and RCE checks are evidence-based and do not exploit or stress the target.</p>
+      <p class="notice">Only scan systems you own or have permission to test. Checks are evidence-based and avoid exploitation or stress.</p>
     </section>
-    <section>
-      <div class="summary" id="summary"></div>
-      <div class="tabs">
-        <button class="tab active" data-view="findings">Findings</button>
-        <button class="tab" data-view="intel">Intel</button>
-        <button class="tab" data-view="responses">Responses</button>
-        <button class="tab" data-view="pages">Pages</button>
-        <button class="tab" data-view="ports">Ports</button>
-      </div>
-      <div id="output" class="empty">Scan results will appear here.</div>
-    </section>
+    <section><div class="summary" id="summary"></div><div class="tabs"><button class="tab active" data-view="findings">Findings</button><button class="tab" data-view="intel">Intel</button><button class="tab" data-view="responses">Responses</button><button class="tab" data-view="pages">Pages</button><button class="tab" data-view="ports">Ports</button></div><div id="output" class="empty">Scan results will appear here.</div></section>
   </main>
   <script>
-    const scanBtn = document.querySelector("#scanBtn");
-    const downloadBtn = document.querySelector("#downloadBtn");
-    const output = document.querySelector("#output");
-    const summary = document.querySelector("#summary");
-    const tabs = document.querySelectorAll(".tab");
-    let latestReport = null;
-    let activeView = "findings";
-
-    const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
-      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
-    }[char]));
-
-    function renderSummary(report) {
-      if (!report) {
-        summary.innerHTML = "";
-        return;
-      }
-      const items = [
-        ["Critical", report.summary.critical],
-        ["High", report.summary.high],
-        ["Medium", report.summary.medium],
-        ["Low", report.summary.low],
-        ["Responses", report.summary.responses || 0],
-        ["Intel", report.summary.discovery || 0],
-        ["TLS Days", report.tls && report.tls.days_left !== null && report.tls.days_left !== undefined ? report.tls.days_left : "n/a"],
-      ];
-      summary.innerHTML = items.map(([label, value]) => `<div class="metric"><strong>${value}</strong><span>${label}</span></div>`).join("");
-    }
-
-    function renderFindings(report) {
-      if (!report.findings.length) {
-        output.className = "empty";
-        output.textContent = "No findings from these checks.";
-        return;
-      }
-      output.className = "";
-      output.innerHTML = report.findings.map((finding) => `
-        <article class="finding">
-          <div class="item-title">
-            <span>${escapeHtml(finding.title)}</span>
-            <span class="badge ${escapeHtml(finding.severity)}">${escapeHtml(finding.severity)}</span>
-          </div>
-          <div class="url">${escapeHtml(finding.url)}</div>
-          <div class="detail">${escapeHtml(finding.category)}: ${escapeHtml(finding.detail)}</div>
-          ${finding.evidence ? `<div class="evidence">${escapeHtml(finding.evidence)}</div>` : ""}
-          ${finding.remediation ? `<div class="remediation"><strong>Fix:</strong> ${escapeHtml(finding.remediation)}</div>` : ""}
-        </article>
-      `).join("");
-    }
-
-    function renderPages(report) {
-      if (!report.pages.length) {
-        output.className = "empty";
-        output.textContent = "No pages crawled.";
-        return;
-      }
-      output.className = "";
-      output.innerHTML = report.pages.map((page) => `
-        <article class="page">
-          <div class="item-title">
-            <span>${escapeHtml(page.title || "Untitled page")}</span>
-            <span class="badge info">${escapeHtml(page.status || "error")}</span>
-          </div>
-          <div class="url">${escapeHtml(page.url)}</div>
-          ${page.error ? `<div class="detail">${escapeHtml(page.error)}</div>` : ""}
-          <div class="detail">${escapeHtml(page.content_type || "unknown content type")}</div>
-          <div class="detail">${page.links.length} link(s), ${page.forms.length} form(s), ${page.scripts.length} script(s)</div>
-        </article>
-      `).join("");
-    }
-
-    function renderPorts(report) {
-      if (!report.ports.length) {
-        output.className = "empty";
-        output.textContent = "No open ports found in the selected scan set.";
-        return;
-      }
-      output.className = "";
-      output.innerHTML = report.ports.map((port) => `
-        <article class="port">
-          <div class="item-title">
-            <span>Port ${escapeHtml(port.port)}</span>
-            <span class="badge info">open</span>
-          </div>
-          <div class="detail">${escapeHtml(port.service_hint)}</div>
-          ${port.banner ? `<div class="evidence">${escapeHtml(port.banner)}</div>` : ""}
-        </article>
-      `).join("");
-    }
-
-    function renderIntel(report) {
-      const tls = report.tls || {};
-      const discoveries = report.discovery || [];
-      const tlsCard = `
-        <article class="response">
-          <div class="item-title">
-            <span>TLS Certificate</span>
-            <span class="badge ${tls.error ? "medium" : "info"}">${tls.enabled ? "checked" : "n/a"}</span>
-          </div>
-          <div class="detail"><strong>Host:</strong> ${escapeHtml(tls.host || report.target)}</div>
-          ${tls.reason ? `<div class="detail">${escapeHtml(tls.reason)}</div>` : ""}
-          ${tls.error ? `<div class="evidence">${escapeHtml(tls.error)}</div>` : ""}
-          ${tls.issuer ? `<div class="detail"><strong>Issuer:</strong> ${escapeHtml(tls.issuer)}</div>` : ""}
-          ${tls.subject ? `<div class="detail"><strong>Subject:</strong> ${escapeHtml(tls.subject)}</div>` : ""}
-          ${tls.not_after ? `<div class="detail"><strong>Expires:</strong> ${escapeHtml(tls.not_after)} (${escapeHtml(tls.days_left)} day(s))</div>` : ""}
-          ${tls.protocol ? `<div class="detail"><strong>Protocol:</strong> ${escapeHtml(tls.protocol)} ${escapeHtml(tls.cipher || "")}</div>` : ""}
-        </article>
-      `;
-      const discoveryCards = discoveries.map((item) => `
-        <article class="response">
-          <div class="item-title">
-            <span>${escapeHtml(item.label)} ${escapeHtml(item.path)}</span>
-            <span class="badge ${item.found ? "info" : "low"}">${item.found ? "found" : "missing"}</span>
-          </div>
-          <div class="url">${escapeHtml(item.url)}</div>
-          <div class="detail">${escapeHtml(item.status || "error")} ${escapeHtml(item.content_type || "")}</div>
-          ${item.preview ? `<div class="evidence body-preview">${escapeHtml(item.preview)}</div>` : ""}
-        </article>
-      `).join("");
-      output.className = "";
-      output.innerHTML = tlsCard + discoveryCards;
-    }
-
-    function renderResponses(report) {
-      const responses = report.responses || [];
-      if (!responses.length) {
-        output.className = "empty";
-        output.textContent = "No response fingerprints captured.";
-        return;
-      }
-      output.className = "";
-      output.innerHTML = responses.map((response) => {
-        const keywords = response.keyword_matches && response.keyword_matches.length
-          ? response.keyword_matches.map((item) => `<span class="pill">${escapeHtml(item)}</span>`).join("")
-          : `<span class="pill">no keyword match</span>`;
-        const matches = response.identical_response_urls && response.identical_response_urls.length
-          ? `<div class="detail">Identical URLs: ${escapeHtml(response.identical_response_urls.join(", "))}</div>`
-          : "";
-        return `
-          <article class="response">
-            <div class="item-title">
-              <span>${escapeHtml(response.url)}</span>
-              <span class="badge ${response.soft_404 ? "low" : "info"}">${escapeHtml(response.status || "error")}</span>
-            </div>
-            <div class="detail"><strong>Content-Type:</strong> ${escapeHtml(response.content_type || "missing")}</div>
-            <div class="detail"><strong>File signature:</strong> ${escapeHtml(response.file_signature || "unknown")}</div>
-            <div class="detail"><strong>Body size:</strong> ${escapeHtml(response.body_size)} bytes</div>
-            <div class="evidence">sha256:${escapeHtml(response.content_hash || "empty")}</div>
-            <div class="pillrow">${keywords}</div>
-            ${response.same_page_detection ? `<div class="detail"><strong>Same-page detection:</strong> ${escapeHtml(response.same_page_detection)}</div>` : ""}
-            ${response.content_hash_comparison ? `<div class="detail"><strong>Content hash comparison:</strong> ${escapeHtml(response.content_hash_comparison)}</div>` : ""}
-            ${matches}
-            ${response.soft_404 ? `<div class="detail"><strong>Soft 404:</strong> ${escapeHtml(response.soft_404_reason)}</div>` : ""}
-            <div class="evidence body-preview">${escapeHtml(response.response_body || "")}${response.response_body_truncated ? "\n...[truncated]" : ""}</div>
-          </article>
-        `;
-      }).join("");
-    }
-
-    function renderReport() {
-      renderSummary(latestReport);
-      if (!latestReport) return;
-      if (activeView === "pages") renderPages(latestReport);
-      else if (activeView === "ports") renderPorts(latestReport);
-      else if (activeView === "responses") renderResponses(latestReport);
-      else if (activeView === "intel") renderIntel(latestReport);
-      else renderFindings(latestReport);
-    }
-
-    tabs.forEach((tab) => {
-      tab.addEventListener("click", () => {
-        tabs.forEach((item) => item.classList.remove("active"));
-        tab.classList.add("active");
-        activeView = tab.dataset.view;
-        renderReport();
-      });
-    });
-
-    scanBtn.addEventListener("click", async () => {
-      const body = {
-        target: document.querySelector("#target").value.trim(),
-        max_pages: Number(document.querySelector("#maxPages").value),
-        timeout: Number(document.querySelector("#timeout").value),
-        scan_ports: document.querySelector("#scanPorts").checked,
-        ports: document.querySelector("#ports").value.trim(),
-        ssrf_callback: document.querySelector("#ssrf").value.trim()
-      };
-      scanBtn.disabled = true;
-      downloadBtn.disabled = true;
-      output.className = "empty";
-      output.textContent = "Scanning with safe probes...";
-      try {
-        const response = await fetch("/api/scan", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body)
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "Scan failed");
-        latestReport = data;
-        downloadBtn.disabled = false;
-        renderReport();
-      } catch (error) {
-        latestReport = null;
-        renderSummary(null);
-        output.className = "empty";
-        output.textContent = error.message;
-      } finally {
-        scanBtn.disabled = false;
-      }
-    });
-
-    downloadBtn.addEventListener("click", () => {
-      if (!latestReport) return;
-      const blob = new Blob([JSON.stringify(latestReport, null, 2)], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `bug-scout-${new Date().toISOString().slice(0, 10)}.json`;
-      link.click();
-      URL.revokeObjectURL(url);
-    });
+    const scanBtn = document.querySelector("#scanBtn"), downloadBtn = document.querySelector("#downloadBtn"), output = document.querySelector("#output"), summary = document.querySelector("#summary"), tabs = document.querySelectorAll(".tab");
+    let latestReport = null, activeView = "findings";
+    const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
+    function renderSummary(report) { if (!report) { summary.innerHTML = ""; return; } const items = [["Critical", report.summary.critical], ["High", report.summary.high], ["Medium", report.summary.medium], ["Low", report.summary.low], ["Responses", report.summary.responses || 0], ["Intel", report.summary.discovery || 0]]; summary.innerHTML = items.map(([label, value]) => `<div class="metric"><strong>${value}</strong><span>${label}</span></div>`).join(""); }
+    function card(title, badge, body, klass = "response") { return `<article class="${klass}"><div class="item-title"><span>${escapeHtml(title)}</span><span class="badge ${escapeHtml(badge)}">${escapeHtml(badge)}</span></div>${body}</article>`; }
+    function renderFindings(report) { if (!report.findings.length) { output.className = "empty"; output.textContent = "No findings from these checks."; return; } output.className = ""; output.innerHTML = report.findings.map((finding) => card(finding.title, finding.severity, `<div class="url">${escapeHtml(finding.url)}</div><div class="detail">${escapeHtml(finding.category)}: ${escapeHtml(finding.detail)}</div>${finding.evidence ? `<div class="evidence">${escapeHtml(finding.evidence)}</div>` : ""}${finding.remediation ? `<div class="remediation"><strong>Fix:</strong> ${escapeHtml(finding.remediation)}</div>` : ""}`, "finding")).join(""); }
+    function renderPages(report) { if (!report.pages.length) { output.className = "empty"; output.textContent = "No pages crawled."; return; } output.className = ""; output.innerHTML = report.pages.map((page) => card(page.title || "Untitled page", "info", `<div class="url">${escapeHtml(page.url)}</div>${page.error ? `<div class="detail">${escapeHtml(page.error)}</div>` : ""}<div class="detail">${escapeHtml(page.status || "error")} ${escapeHtml(page.content_type || "unknown content type")}</div><div class="detail">${page.links.length} link(s), ${page.forms.length} form(s), ${page.scripts.length} script(s)</div>`, "page")).join(""); }
+    function renderPorts(report) { if (!report.ports.length) { output.className = "empty"; output.textContent = "No open ports found in the selected scan set."; return; } output.className = ""; output.innerHTML = report.ports.map((port) => card(`Port ${port.port}`, "info", `<div class="detail">${escapeHtml(port.service_hint)}</div>${port.banner ? `<div class="evidence">${escapeHtml(port.banner)}</div>` : ""}`, "port")).join(""); }
+    function renderIntel(report) { const tls = report.tls || {}, discoveries = report.discovery || []; output.className = ""; output.innerHTML = card("TLS Certificate", tls.error ? "medium" : "info", `<div class="detail"><strong>Host:</strong> ${escapeHtml(tls.host || report.target)}</div>${tls.reason ? `<div class="detail">${escapeHtml(tls.reason)}</div>` : ""}${tls.error ? `<div class="evidence">${escapeHtml(tls.error)}</div>` : ""}${tls.not_after ? `<div class="detail"><strong>Expires:</strong> ${escapeHtml(tls.not_after)}</div>` : ""}`) + discoveries.map((item) => card(`${item.url}`, item.status && item.status < 404 ? "info" : "low", `<div class="detail">${escapeHtml(item.status || "error")} ${escapeHtml(item.content_type || "")}</div>`)).join(""); }
+    function renderResponses(report) { const responses = report.responses || []; if (!responses.length) { output.className = "empty"; output.textContent = "No response fingerprints captured."; return; } output.className = ""; output.innerHTML = responses.map((response) => { const keywords = response.keyword_matches && response.keyword_matches.length ? response.keyword_matches.map((item) => `<span class="pill">${escapeHtml(item)}</span>`).join("") : `<span class="pill">no keyword match</span>`; return card(response.url, response.soft_404 ? "low" : "info", `<div class="detail"><strong>Content-Type:</strong> ${escapeHtml(response.content_type || "missing")}</div><div class="detail"><strong>File signature:</strong> ${escapeHtml(response.file_signature || "unknown")}</div><div class="detail"><strong>Body size:</strong> ${escapeHtml(response.body_size)} bytes</div><div class="evidence">sha256:${escapeHtml(response.content_hash || "empty")}</div><div class="pillrow">${keywords}</div>${response.soft_404 ? `<div class="detail"><strong>Soft 404:</strong> ${escapeHtml(response.soft_404_reason)}</div>` : ""}<div class="evidence body-preview">${escapeHtml(response.response_body || "")}${response.response_body_truncated ? "\n...[truncated]" : ""}</div>`); }).join(""); }
+    function renderReport() { renderSummary(latestReport); if (!latestReport) return; if (activeView === "pages") renderPages(latestReport); else if (activeView === "ports") renderPorts(latestReport); else if (activeView === "responses") renderResponses(latestReport); else if (activeView === "intel") renderIntel(latestReport); else renderFindings(latestReport); }
+    tabs.forEach((tab) => tab.addEventListener("click", () => { tabs.forEach((item) => item.classList.remove("active")); tab.classList.add("active"); activeView = tab.dataset.view; renderReport(); }));
+    scanBtn.addEventListener("click", async () => { const body = { target: document.querySelector("#target").value.trim(), max_pages: Number(document.querySelector("#maxPages").value), timeout: Number(document.querySelector("#timeout").value), scan_ports: document.querySelector("#scanPorts").checked, ports: document.querySelector("#ports").value.trim(), ssrf_callback: document.querySelector("#ssrf").value.trim() }; scanBtn.disabled = true; downloadBtn.disabled = true; output.className = "empty"; output.textContent = "Scanning with safe probes..."; try { const response = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || "Scan failed"); latestReport = data; downloadBtn.disabled = false; renderReport(); } catch (error) { latestReport = null; renderSummary(null); output.className = "empty"; output.textContent = error.message; } finally { scanBtn.disabled = false; } });
+    downloadBtn.addEventListener("click", () => { if (!latestReport) return; const blob = new Blob([JSON.stringify(latestReport, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = `bug-scout-${new Date().toISOString().slice(0, 10)}.json`; link.click(); URL.revokeObjectURL(url); });
   </script>
 </body>
 </html>
@@ -1508,9 +1301,12 @@ INDEX_HTML = r"""<!doctype html>
 
 
 def main() -> None:
+    """Start the local scanner web server."""
+
+    configure_logging()
     server = ThreadingHTTPServer((HOST, PORT), ScoutHandler)
-    print(f"BG Bug Scout running at http://{HOST}:{PORT}")
-    print("Use only on systems you own or have explicit permission to test.")
+    LOGGER.info("BG Bug Scout running at http://%s:%s", HOST, PORT)
+    LOGGER.info("Use only on systems you own or have explicit permission to test.")
     server.serve_forever()
 
 
