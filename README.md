@@ -67,6 +67,36 @@ Use Python 3.10 or newer.
 python app.py
 ```
 
+This starts the local server and opens an interactive terminal menu:
+
+```text
+Main menu
+  1) Open browser
+  2) Open here / terminal scan
+  u) Update from GitHub
+  q) Quit
+```
+
+Choose `1` to open the browser UI. Choose `2` to scan directly inside the terminal. The terminal scan asks what you want to scan:
+
+```text
+a) XSS
+b) CSRF
+c) SSRF
+d) CSD / CSP / CORS
+e) GraphQL
+f) Nmap-style port scan
+g) Full scan
+```
+
+After choosing a scan type, enter the site/IP, optional ports, optional SSRF callback, and an XSS payload if needed.
+
+To start only the web server without the menu:
+
+```bash
+python app.py --serve
+```
+
 ### 4. Open The UI
 
 ```text
@@ -124,6 +154,12 @@ Run scans without opening an external browser:
 
 ```bash
 python app.py --target https://example.com --max-pages 1 --output text
+```
+
+Custom XSS payload:
+
+```bash
+python app.py --target https://example.com/search?q=test --output text --xss-payload "<svg/onload=alert(1)>"
 ```
 
 Export formats:

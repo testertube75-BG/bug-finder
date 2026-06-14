@@ -14,10 +14,12 @@ import re
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -837,37 +839,37 @@ def check_ssrf_url_parameters(page: PageResult, findings: list[Finding], ssrf_ca
         )
 
 
-def build_reflected_xss_probe_urls(page: PageResult) -> list[str]:
+def build_reflected_xss_probe_urls(page: PageResult, payload: str = XSS_TEST_PAYLOAD) -> list[str]:
     """Build safe reflected-XSS probe URLs from query parameters and GET forms."""
 
     probes: list[str] = []
     parsed = urllib.parse.urlparse(page.url)
     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
     if query:
-        mutated = {key: [XSS_TEST_PAYLOAD] for key in query}
+        mutated = {key: [payload] for key in query}
         probes.append(urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(mutated, doseq=True))))
     for form in page.forms:
         if str(form.get("method", "GET")).upper() != "GET":
             continue
         action = str(form.get("action", page.url))
         inputs = form.get("inputs", [])
-        values = {str(item.get("name", "q")): XSS_TEST_PAYLOAD for item in inputs if item.get("name")}
+        values = {str(item.get("name", "q")): payload for item in inputs if item.get("name")}
         if values:
             form_parsed = urllib.parse.urlparse(action)
             probes.append(urllib.parse.urlunparse(form_parsed._replace(query=urllib.parse.urlencode(values))))
     return sorted(set(probes))[:10]
 
 
-def check_reflected_xss(page: PageResult, timeout: int, findings: list[Finding]) -> None:
+def check_reflected_xss(page: PageResult, timeout: int, findings: list[Finding], payload: str = XSS_TEST_PAYLOAD) -> None:
     """Send non-destructive canary probes to detect reflected XSS candidates."""
 
-    for probe_url in build_reflected_xss_probe_urls(page):
+    for probe_url in build_reflected_xss_probe_urls(page, payload):
         probe_page, probe_text = fetch_analyzed_page(probe_url, timeout)
         if probe_page.error or not probe_text:
             continue
-        reflected_raw = XSS_TEST_PAYLOAD in probe_text
-        reflected_canary = XSS_CANARY in probe_text
-        escaped_payload = html.escape(XSS_TEST_PAYLOAD) in probe_text
+        reflected_raw = payload in probe_text
+        reflected_canary = XSS_CANARY in probe_text or payload in probe_text
+        escaped_payload = html.escape(payload) in probe_text
         if reflected_raw:
             severity = "high"
             evidence = "raw payload reflected"
@@ -884,7 +886,7 @@ def check_reflected_xss(page: PageResult, timeout: int, findings: list[Finding])
             category="xss-reflected",
             detail="A safe XSS canary was reflected in the response.",
             evidence=evidence,
-            poc=f"Probe URL: {probe_url}; payload: {XSS_TEST_PAYLOAD}",
+            poc=f"Probe URL: {probe_url}; payload: {payload}",
             remediation="Contextually encode reflected input and validate user-controlled parameters.",
         )
 
@@ -1214,11 +1216,12 @@ class ContentAnalyzer:
 class SecurityChecker:
     """Encapsulate page-level security checks and finding collection."""
 
-    def __init__(self, ssrf_callback: str = "", timeout: int = DEFAULT_CONFIG.request_timeout) -> None:
+    def __init__(self, ssrf_callback: str = "", timeout: int = DEFAULT_CONFIG.request_timeout, xss_payload: str = XSS_TEST_PAYLOAD) -> None:
         """Create a checker with optional SSRF callback context for evidence notes."""
 
         self.ssrf_callback = ssrf_callback
         self.timeout = timeout
+        self.xss_payload = xss_payload
         self.findings: list[Finding] = []
 
     def check_all(
@@ -1235,7 +1238,7 @@ class SecurityChecker:
         self.check_response_analysis(page)
         self.check_forms(page)
         check_ssrf_url_parameters(page, self.findings, self.ssrf_callback)
-        check_reflected_xss(page, self.timeout, self.findings)
+        check_reflected_xss(page, self.timeout, self.findings, self.xss_payload)
         if soft_404_baseline:
             mark_soft_404(page, body_text, soft_404_baseline, soft_404_text)
         return self.findings
@@ -1703,6 +1706,7 @@ def scan_target(
     scan_port_flag: bool = True,
     ports: str = "",
     ssrf_callback: str = "",
+    xss_payload: str = XSS_TEST_PAYLOAD,
 ) -> dict[str, Any]:
     """
     Scan an authorized web application for security issues.
@@ -1718,6 +1722,7 @@ def scan_target(
         scan_port_flag: Whether TCP port scanning is enabled.
         ports: Custom port list such as "80,443,8000-8010"; empty means common ports.
         ssrf_callback: Optional callback URL noted in SSRF-related evidence.
+        xss_payload: Optional reflected-XSS probe payload for authorized testing.
 
     Returns:
         A report dictionary containing target, scanned_at, duration_ms,
@@ -1757,7 +1762,7 @@ def scan_target(
         baseline_path = f"/__bg_bug_scout_missing_{hashlib.sha1(config.target.encode()).hexdigest()[:12]}"
         baseline_page, baseline_text = fetch_analyzed_page(config.target.rstrip("/") + baseline_path, config.timeout)
 
-        checker = SecurityChecker(config.ssrf_callback, config.timeout)
+        checker = SecurityChecker(config.ssrf_callback, config.timeout, xss_payload or XSS_TEST_PAYLOAD)
         checker.findings.extend(findings)
         for page in all_response_pages:
             body_text = body_texts.get(page.url, "")
@@ -1913,6 +1918,7 @@ class ScoutHandler(BaseHTTPRequestHandler):
                 parse_bool(payload.get("scan_ports"), True),
                 str(payload.get("ports", "")),
                 str(payload.get("ssrf_callback", "")),
+                str(payload.get("xss_payload", XSS_TEST_PAYLOAD)),
             )
             self.send_json(HTTPStatus.OK, report)
         except ValueError as exc:
@@ -1986,6 +1992,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="row"><div><label for="maxPages">Max pages</label><input id="maxPages" type="number" min="1" value="8"></div><div><label for="timeout">Timeout sec</label><input id="timeout" type="number" min="2" max="20" value="8"></div></div>
       <div class="checkrow"><input id="scanPorts" type="checkbox" checked><span>Auto port scan</span></div>
       <label for="ports" style="margin-top:14px">Ports</label><input id="ports" placeholder="common, or 80,443,8000-8010">
+      <label for="payload" style="margin-top:14px">XSS payload</label><input id="payload" placeholder="<svg/onload=alert('bg-xss')>">
       <label for="ssrf" style="margin-top:14px">SSRF callback URL</label><input id="ssrf" placeholder="optional https://your-callback.example/id">
       <button class="primary" id="scanBtn">Run safe scan</button>
       <p class="notice">Only scan systems you own or have permission to test. Checks are evidence-based and avoid exploitation or stress.</p>
@@ -2005,7 +2012,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderResponses(report) { const responses = report.responses || []; if (!responses.length) { output.className = "empty"; output.textContent = "No backend server responses captured."; return; } output.className = ""; output.innerHTML = responses.map((response) => { const keywords = response.keyword_matches && response.keyword_matches.length ? response.keyword_matches.map((item) => `<span class="pill">${escapeHtml(item)}</span>`).join("") : `<span class="pill">no keyword match</span>`; return card(response.url, response.soft_404 ? "low" : "info", `<div class="detail"><strong>Status:</strong> ${escapeHtml(response.status || "error")}</div><div class="detail"><strong>Content-Type:</strong> ${escapeHtml(response.content_type || "missing")}</div><div class="detail"><strong>File signature:</strong> ${escapeHtml(response.file_signature || "unknown")}</div><div class="detail"><strong>Body size:</strong> ${escapeHtml(response.body_size)} bytes</div><div class="evidence">sha256:${escapeHtml(response.content_hash || "empty")}</div><div class="pillrow">${keywords}</div>${response.soft_404 ? `<div class="detail"><strong>Soft 404:</strong> ${escapeHtml(response.soft_404_reason)}</div>` : ""}<div class="detail"><strong>Decoded backend response:</strong></div><div class="evidence body-preview">${escapeHtml(response.response_body || "")}${response.response_body_truncated ? "\n...[truncated]" : ""}</div>`); }).join(""); }
     function renderReport() { renderSummary(latestReport); if (!latestReport) return; if (activeView === "pages") renderPages(latestReport); else if (activeView === "ports") renderPorts(latestReport); else if (activeView === "responses") renderResponses(latestReport); else if (activeView === "intel") renderIntel(latestReport); else renderFindings(latestReport); }
     tabs.forEach((tab) => tab.addEventListener("click", () => { tabs.forEach((item) => item.classList.remove("active")); tab.classList.add("active"); activeView = tab.dataset.view; renderReport(); }));
-    scanBtn.addEventListener("click", async () => { const body = { target: document.querySelector("#target").value.trim(), max_pages: Number(document.querySelector("#maxPages").value), timeout: Number(document.querySelector("#timeout").value), scan_ports: document.querySelector("#scanPorts").checked, ports: document.querySelector("#ports").value.trim(), ssrf_callback: document.querySelector("#ssrf").value.trim() }; scanBtn.disabled = true; downloadBtn.disabled = true; csvBtn.disabled = true; htmlBtn.disabled = true; output.className = "empty"; output.textContent = "Scanning with safe probes..."; try { const response = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || "Scan failed"); latestReport = data; downloadBtn.disabled = false; csvBtn.disabled = false; htmlBtn.disabled = false; renderReport(); } catch (error) { latestReport = null; renderSummary(null); output.className = "empty"; output.textContent = error.message; } finally { scanBtn.disabled = false; } });
+    scanBtn.addEventListener("click", async () => { const body = { target: document.querySelector("#target").value.trim(), max_pages: Number(document.querySelector("#maxPages").value), timeout: Number(document.querySelector("#timeout").value), scan_ports: document.querySelector("#scanPorts").checked, ports: document.querySelector("#ports").value.trim(), xss_payload: document.querySelector("#payload").value.trim(), ssrf_callback: document.querySelector("#ssrf").value.trim() }; scanBtn.disabled = true; downloadBtn.disabled = true; csvBtn.disabled = true; htmlBtn.disabled = true; output.className = "empty"; output.textContent = "Scanning with safe probes..."; try { const response = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || "Scan failed"); latestReport = data; downloadBtn.disabled = false; csvBtn.disabled = false; htmlBtn.disabled = false; renderReport(); } catch (error) { latestReport = null; renderSummary(null); output.className = "empty"; output.textContent = error.message; } finally { scanBtn.disabled = false; } });
     updateBtn.addEventListener("click", async () => { updateBtn.disabled = true; output.className = "empty"; output.textContent = "Checking GitHub for updates..."; try { const response = await fetch("/api/update", { method: "POST" }); const data = await response.json(); if (!response.ok) throw new Error(data.error || "Update failed"); output.className = "empty"; output.textContent = data.updated ? `Updated ${data.files.length} file(s). Restart the app to load Python changes.` : "No updates found."; } catch (error) { output.className = "empty"; output.textContent = error.message; } finally { updateBtn.disabled = false; } });
     downloadBtn.addEventListener("click", () => { if (!latestReport) return; const blob = new Blob([JSON.stringify(latestReport, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = `bug-scout-${new Date().toISOString().slice(0, 10)}.json`; link.click(); URL.revokeObjectURL(url); });
     csvBtn.addEventListener("click", () => { if (!latestReport) return; const blob = new Blob([latestReport.exports?.findings_csv || ""], { type: "text/csv" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = `bug-scout-${new Date().toISOString().slice(0, 10)}.csv`; link.click(); URL.revokeObjectURL(url); });
@@ -2020,7 +2027,7 @@ def run_terminal_scan(args: argparse.Namespace) -> int:
     """Run one scan from the terminal and print the selected output format."""
 
     configure_logging(args.log_level or logging.ERROR)
-    report = scan_target(args.target, args.max_pages, args.timeout, args.scan_ports, args.ports, args.ssrf_callback)
+    report = scan_target(args.target, args.max_pages, args.timeout, args.scan_ports, args.ports, args.ssrf_callback, args.xss_payload)
     if args.output == "json":
         print(json.dumps(report, indent=2))
     elif args.output == "csv":
@@ -2032,6 +2039,105 @@ def run_terminal_scan(args: argparse.Namespace) -> int:
     else:
         print(format_terminal_report(report))
     return 0
+
+
+SCAN_TYPE_OPTIONS: Final[dict[str, tuple[str, set[str]]]] = {
+    "a": ("XSS", {"xss-reflected", "xss-dom", "xss-stored"}),
+    "b": ("CSRF", {"csrf"}),
+    "c": ("SSRF", {"ssrf", "forms"}),
+    "d": ("CSD / CSP / CORS", {"csd", "headers"}),
+    "e": ("GraphQL", {"graphql"}),
+    "f": ("Nmap-style port scan", {"ports"}),
+    "g": ("Full scan", set()),
+}
+
+
+def filter_report_for_scan_type(report: dict[str, Any], scan_type: str) -> dict[str, Any]:
+    """Filter terminal report findings for a selected scan type."""
+
+    label, categories = SCAN_TYPE_OPTIONS.get(scan_type, SCAN_TYPE_OPTIONS["g"])
+    filtered = dict(report)
+    filtered["selected_scan"] = label
+    if not categories:
+        return filtered
+    if "ports" in categories:
+        filtered["findings"] = [item for item in report.get("findings", []) if item.get("category") == "ports"]
+        return filtered
+    filtered["findings"] = [item for item in report.get("findings", []) if item.get("category") in categories]
+    return filtered
+
+
+def prompt_choice(prompt: str, default: str = "") -> str:
+    """Read one terminal prompt with an optional default."""
+
+    value = input(prompt).strip()
+    return value or default
+
+
+def prompt_scan_type() -> str:
+    """Ask the user which scan category to run in terminal mode."""
+
+    print("\nWhat do you want to scan?")
+    for key, (label, _) in SCAN_TYPE_OPTIONS.items():
+        print(f"  {key}) {label}")
+    choice = prompt_choice("Select option [g]: ", "g").lower()
+    return choice if choice in SCAN_TYPE_OPTIONS else "g"
+
+
+def run_interactive_scan() -> None:
+    """Collect scan options interactively and run the selected terminal scan."""
+
+    scan_type = prompt_scan_type()
+    target = prompt_choice("Site/IP target: ")
+    if not target:
+        print("Target is required.")
+        return
+    max_pages = int(prompt_choice("Max pages [1]: ", "1"))
+    timeout = int(prompt_choice("Timeout seconds [8]: ", "8"))
+    default_ports = "common" if scan_type == "f" else ""
+    ports = prompt_choice("Optional ports, e.g. 80,443,8000-8010 [empty]: ", default_ports)
+    payload = prompt_choice(f"XSS payload [{XSS_TEST_PAYLOAD}]: ", XSS_TEST_PAYLOAD)
+    ssrf_callback = prompt_choice("SSRF callback URL [empty]: ", "")
+    scan_ports_enabled = scan_type == "f" or bool(ports)
+    report = scan_target(target, max_pages, timeout, scan_ports_enabled, ports, ssrf_callback, payload)
+    print(format_terminal_report(filter_report_for_scan_type(report, scan_type)))
+    if scan_type == "f" and report.get("ports"):
+        print("\nPort details:")
+        for port in report["ports"]:
+            print(
+                f"- {port['host']}:{port['port']}/{port['protocol']} "
+                f"{port['state']} reason={port['reason']} service={port['service_hint']} latency={port['latency_ms']}ms"
+            )
+
+
+def run_interactive_menu(server: ThreadingHTTPServer) -> int:
+    """Run the default terminal menu while the local web server stays active."""
+
+    url = f"http://{HOST}:{PORT}/"
+    print(f"BG Bug Scout server running at {url}")
+    print("Use only on systems you own or have explicit permission to test.")
+    while True:
+        print("\nMain menu")
+        print("  1) Open browser")
+        print("  2) Open here / terminal scan")
+        print("  u) Update from GitHub")
+        print("  q) Quit")
+        choice = prompt_choice("Select option: ").lower()
+        if choice == "1":
+            opened = webbrowser.open(url)
+            print(f"Browser open requested: {url}" if opened else f"Open this URL manually: {url}")
+        elif choice == "2":
+            run_interactive_scan()
+        elif choice == "u":
+            print(json.dumps(apply_updates(), indent=2))
+            print("Restart the app if Python files were updated.")
+        elif choice == "q":
+            server.shutdown()
+            server.server_close()
+            print("Server stopped.")
+            return 0
+        else:
+            print("Unknown option.")
 
 
 def run_update_command(apply: bool) -> int:
@@ -2055,11 +2161,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-ports", action="store_true", help="Enable port scanning in terminal mode")
     parser.add_argument("--ports", default="", help="Ports such as common, 80,443, or 8000-8010")
     parser.add_argument("--ssrf-callback", default="", help="Optional SSRF callback URL for evidence notes")
+    parser.add_argument("--xss-payload", default=XSS_TEST_PAYLOAD, help="Reflected-XSS probe payload for authorized scans")
     parser.add_argument("--output", choices=["text", "json", "csv", "html"], default="text", help="Terminal output format")
     parser.add_argument("--output-file", default="bug-scout-report.html", help="Path for --output html")
     parser.add_argument("--log-level", default=None, help="Logging level for terminal mode; default keeps scan output clean")
     parser.add_argument("--update", action="store_true", help="Check GitHub main for app file updates")
     parser.add_argument("--apply-update", action="store_true", help="Download and replace changed files from GitHub main")
+    parser.add_argument("--serve", action="store_true", help="Start only the web server without the interactive terminal menu")
     return parser
 
 
@@ -2074,12 +2182,21 @@ def main(argv: list[str] | None = None) -> int:
         return run_update_command(apply=False)
     if args.target:
         return run_terminal_scan(args)
-    configure_logging()
+    configure_logging(logging.ERROR)
     server = ThreadingHTTPServer((HOST, PORT), ScoutHandler)
-    LOGGER.info("BG Bug Scout running at http://%s:%s", HOST, PORT)
-    LOGGER.info("Use only on systems you own or have explicit permission to test.")
-    server.serve_forever()
-    return 0
+    if args.serve:
+        print(f"BG Bug Scout running at http://{HOST}:{PORT}/")
+        server.serve_forever()
+        return 0
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        return run_interactive_menu(server)
+    except KeyboardInterrupt:
+        server.shutdown()
+        server.server_close()
+        print("\nServer stopped.")
+        return 0
 
 
 if __name__ == "__main__":

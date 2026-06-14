@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app import Finding, MLDetector, PageResult, ResponseAnalysis, build_arg_parser, build_reflected_xss_probe_urls, build_update_plan, check_client_side_defenses, check_xss_indicators, detect_dom_xss_sinks, findings_to_csv, infer_service_version, normalize_url, parse_ports, report_to_html, service_hint, ScanConfig, TargetError
+from app import Finding, MLDetector, PageResult, ResponseAnalysis, build_arg_parser, build_reflected_xss_probe_urls, build_update_plan, check_client_side_defenses, check_xss_indicators, detect_dom_xss_sinks, filter_report_for_scan_type, findings_to_csv, infer_service_version, normalize_url, parse_ports, report_to_html, service_hint, ScanConfig, TargetError
 from rate_limiter import RateLimiter
 
 
@@ -106,8 +106,8 @@ class TestScanConfig(unittest.TestCase):
     def test_reflected_xss_probe_url_builder(self) -> None:
         """Query parameters produce reflected-XSS probe URLs."""
 
-        probes = build_reflected_xss_probe_urls(PageResult("https://example.com/search?q=test"))
-        self.assertIn("bg-xss", probes[0])
+        probes = build_reflected_xss_probe_urls(PageResult("https://example.com/search?q=test"), "custom-payload")
+        self.assertIn("custom-payload", probes[0])
 
     def test_weak_csp_detection_adds_poc(self) -> None:
         """Weak CSP headers produce CSD findings with PoC."""
@@ -121,9 +121,16 @@ class TestScanConfig(unittest.TestCase):
     def test_cli_parser_accepts_terminal_mode(self) -> None:
         """CLI parser supports terminal-only scan arguments."""
 
-        args = build_arg_parser().parse_args(["--target", "example.com", "--output", "json"])
+        args = build_arg_parser().parse_args(["--target", "example.com", "--output", "json", "--xss-payload", "test"])
         self.assertEqual(args.target, "example.com")
         self.assertEqual(args.output, "json")
+        self.assertEqual(args.xss_payload, "test")
+
+    def test_cli_parser_accepts_serve_mode(self) -> None:
+        """CLI parser supports direct web-server mode."""
+
+        args = build_arg_parser().parse_args(["--serve"])
+        self.assertTrue(args.serve)
 
     def test_cli_parser_accepts_update_mode(self) -> None:
         """CLI parser supports update checks."""
@@ -137,6 +144,14 @@ class TestScanConfig(unittest.TestCase):
         plan = build_update_plan({"app.py": "remote"}, {"app.py": "local"})
         self.assertEqual(plan[0]["path"], "app.py")
         self.assertNotEqual(plan[0]["local_sha256"], plan[0]["remote_sha256"])
+
+    def test_filter_report_for_scan_type(self) -> None:
+        """Interactive scan filters findings by selected category."""
+
+        report = {"findings": [{"category": "xss-dom"}, {"category": "csrf"}]}
+        filtered = filter_report_for_scan_type(report, "a")
+        self.assertEqual(len(filtered["findings"]), 1)
+        self.assertEqual(filtered["findings"][0]["category"], "xss-dom")
 
 
 if __name__ == "__main__":
