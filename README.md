@@ -1,76 +1,126 @@
 # BG Bug Scout
 
-BG Bug Scout is a local-first security testing assistant for authorized bug bounty work, web app hardening, and defensive review. It combines safe crawling, response fingerprinting, passive intelligence, and low-impact probes in a simple browser UI.
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Tests](https://img.shields.io/badge/Tests-unittest-2EA44F?style=for-the-badge)
+![Security](https://img.shields.io/badge/Safe%20Scanning-Authorized%20Targets-0C7A6F?style=for-the-badge)
+![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)
 
-## Important Scope Rule
+BG Bug Scout is a local web security scanner for authorized targets. It crawls pages, checks headers, fingerprints responses, detects risky exposed files, checks TLS metadata, and can run bounded TCP port scans.
 
-Use this only on systems you own or have clear written permission to test. BG Bug Scout is designed to help find and document real security issues without destructive exploitation, denial-of-service testing, stealth, persistence, or unauthorized access.
+> [!IMPORTANT]
+> Only scan systems you own or have explicit permission to test.
 
-## What It Checks
+## Features
 
-- Same-origin web crawl with off-scope redirect blocking.
-- Security headers, cookies, CORS, CSP, HSTS, mixed content, and technology disclosure.
-- Response fingerprinting with body preview, Content-Type, file signature, SHA-256 hash, duplicate body detection, keyword matches, and soft 404 detection.
-- Low-impact reflected input probes for XSS review, SQL error signals, form reflection, SSRF-prone parameter names, and optional callback canary submission.
-- Sensitive exposure checks for `.env`, `.git/config`, database dumps, backups, server status, phpinfo, and actuator endpoints.
-- TLS certificate intelligence including issuer, subject, protocol, cipher, expiry date, and renewal findings.
-- Passive discovery for `robots.txt`, `security.txt`, `.well-known/security.txt`, and `sitemap.xml`.
-- Rate-limited TCP port checks for common services and high-risk exposure signals.
-- DoS and RCE risk indicators from visible configuration, headers, banners, and surface evidence only.
-- JSON report download for bug bounty notes and remediation tracking.
+| Area | Included |
+| --- | --- |
+| Web checks | Header checks, content fingerprints, risky file discovery, soft-404 signals |
+| Response analysis | Content-Type validation, file signatures, keyword indicators, duplicate hash detection |
+| Port scan | Bounded `ThreadPoolExecutor` scanning with configurable port lists |
+| Safety | Private-network target blocking, body-size limits, rate limiting |
+| Quality | Type hints, custom exceptions, logging, unit tests, CI workflow |
 
-## What It Does Not Do
+## Run Step by Step
 
-- It does not perform real exploit chains.
-- It does not brute force passwords or tokens.
-- It does not bypass authentication.
-- It does not run destructive payloads.
-- It does not perform denial-of-service or stress testing.
-- It does not hide traffic or evade monitoring.
+### 1. Clone the repository
 
-## Run
+```bash
+git clone https://github.com/testertube75-BG/bug-finder.git
+cd bug-finder
+```
 
-Double-click:
+### 2. Check Python version
+
+```bash
+python --version
+```
+
+Use Python 3.10 or newer.
+
+### 3. Start the app
+
+```bash
+python app.py
+```
+
+### 4. Open the browser
+
+Go to:
 
 ```text
-start.bat
+http://127.0.0.1:8765/
 ```
 
-Or run from PowerShell:
+### 5. Run a scan
 
-```powershell
-.\start.ps1
+1. Enter an authorized target URL, for example `https://example.com`.
+2. Set `Max pages`, `Timeout sec`, and optional ports.
+3. Click **Run safe scan**.
+4. Review the **Findings**, **Intel**, **Responses**, **Pages**, and **Ports** tabs.
+5. Click **Download JSON** to save the report.
+
+## API Usage
+
+Send a scan request to the local API:
+
+```bash
+curl -X POST http://127.0.0.1:8765/api/scan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target": "https://example.com",
+    "max_pages": 1,
+    "timeout": 5,
+    "scan_ports": false,
+    "ports": "",
+    "ssrf_callback": ""
+  }'
 ```
 
-Then open:
+More details are in [API.md](API.md).
+
+## Run Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Expected result:
 
 ```text
-http://127.0.0.1:8765
+OK
 ```
 
-Manual Windows start:
+## Configuration
 
-```powershell
-py .\app.py
+Edit [config.py](config.py) to change runtime defaults.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `host` | `127.0.0.1` | Local bind address |
+| `port` | `8765` | Local app port |
+| `max_body_bytes` | `600000` | Maximum response body read size |
+| `max_pages_limit` | `30` | Maximum crawl page cap |
+| `max_workers` | `5` | Bounded worker count |
+| `request_timeout` | `8` | Default request timeout |
+| `log_level` | `INFO` | Logging level |
+| `log_file` | `bug-scout.log` | Optional log file path |
+
+## Troubleshooting
+
+| Problem | Fix |
+| --- | --- |
+| Port already in use | Change `port` in `config.py`, then run `python app.py` again. |
+| Browser cannot open app | Confirm the server is running and open `http://127.0.0.1:8765/`. |
+| Scan rejected | Private, loopback, link-local, and multicast targets are blocked by design. |
+| Too many requests | Wait for the rate-limit window to reset, then retry. |
+
+## Project Files
+
+```text
+app.py                         Main local web app and scanner
+config.py                      Runtime configuration
+rate_limiter.py                Local request rate limiter
+API.md                         API documentation
+tests/                         Unit tests
+.github/workflows/test.yml     CI workflow
 ```
-
-## Bug Bounty Workflow
-
-1. Confirm the target is in scope.
-2. Run a safe scan with a small page limit first.
-3. Review critical and high findings manually.
-4. Save the JSON report.
-5. Write a clear report with impact, evidence, steps to reproduce, and remediation.
-6. Never include private user data unless the program rules explicitly allow it.
-
-## Support
-
-If this project helps you and you want to support the maintainer, use:
-
-[GitHub Sponsors for testertube75-BG](https://github.com/sponsors/testertube75-BG)
-
-The maintainer must enable GitHub Sponsors before payments can be received there.
-
-## License
-
-This project is released under the MIT License. See [LICENSE](LICENSE).
