@@ -102,7 +102,7 @@ Edit [config.py](config.py) to change runtime defaults.
 | `max_pages_limit` | `unlimited` | Set an integer page count to cap crawls | Maximum crawl page cap |
 | `max_workers` | `unlimited` | Set an integer worker count to cap concurrency | Worker count for concurrent checks |
 | `request_timeout` | `8` | API clamps request values to 2-20 seconds | Default request timeout |
-| `log_level` | `INFO` | `DEBUG`, `INFO`, `LOW`, `MEDIUM`, `MIDIUM`, `HIGH`, `CRITICAL` | Logging level |
+| `log_level` | `INFO` | `DEBUG`, `INFO`, `LOW`, `MEDIUM`, `HIGH`, `CRITICAL` | Logging level |
 | `log_file` | `bug-scout.log` | Optional file path | Optional log file path |
 
 > [!NOTE]
